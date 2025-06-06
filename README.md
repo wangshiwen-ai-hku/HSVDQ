@@ -20,8 +20,10 @@ We propose an optimization-based framework for LUT-based post-training non-unifo
 1. **Problem Formulation**:
 
     We Formulate layer-wise, channel-wise LUT-based non-uniform quantization as a mixed-integer quartic programming problem:
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     $$
-    \min_{\mathbf{S}_i, \mathbf{T}_i} |\mathbf{W}_i \mathbf{X} - \mathbf{T}_i \mathbf{S}_i \mathbf{X}|^2\ s.t.\ \mathbf{1}^\top \mathbf{S}_i = \mathbf{1}^\top, \forall i,
+    \min_{\mathbf{S}_i, \mathbf{T}_i} \|\mathbf{W}_i \mathbf{X} - \mathbf{T}_i \mathbf{S}_i \mathbf{X}\|^2\ s.t.\ \mathbf{1}^\top \mathbf{S}_i = \mathbf{1}^\top, \forall i,
     $$
     where $\mathbf{W}_i \in \mathbb{R}^{1 \times n}$ is the $i$-th row of $\mathbf{W}$, $\mathbf{T}_i \in \mathbb{R}^{1 \times 2^N}$ is the $i$-th row of $\mathbf{T}$, $\mathbf{S}_i \in \{0, 1\}^{2^N \times n}$ is a column-wise one-hot encoding matrix indicating the mapping of elements from $\mathbf{T}_i$, and $\mathbf{1}$ denotes an all-one vector.
 2. **Alternating Direction Optimization**:
