@@ -13,7 +13,7 @@ The University of Hong Kong
 ## TL;DR
 > How can we efficiently determine a lookup table (LUT) for LUT-based post-training non-uniform quantization that achieves a balance between model accuracy and model size effectively?
 
-**Approach**:
+## Approach
 
 We propose an optimization-based framework for LUT-based post-training non-uniform quantization:
 
@@ -47,7 +47,7 @@ We propose an optimization-based framework for LUT-based post-training non-unifo
 4. **Solving the $\mathbf{S}_i$-Subproblem**:
 
     For the $\mathbf{S}_i$-subproblem, the objective can be rewritten as:
-    
+
     <div align="center">
         <img src="https://latex.codecogs.com/svg.latex?\begin{align}&(\mathbf{W}_i-\mathbf{T}_i^k\mathbf{S}_i)(\mathbf{X}\mathbf{X}^\top)(\mathbf{W}_i-\mathbf{T}_i^k\mathbf{S}_i)^\top\\=& (\mathbf{W}_i-\mathbf{T}_i^k\mathbf{S}_i)(\mathbf{L}\mathbf{L}^\top)(\mathbf{W}_i-\mathbf{T}_i^k\mathbf{S}_i)^\top\\=& \|\mathbf{W}_i\mathbf{L} - \mathbf{T}_i^k\mathbf{S}_i\mathbf{L}\|^2.\end{align}" />
     </div>
