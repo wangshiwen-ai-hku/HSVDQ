@@ -973,6 +973,83 @@ def self_test_command(_args: argparse.Namespace) -> None:
     )
 
 
+def integration_test_command(_args: argparse.Namespace) -> None:
+    """Exercise Qwen hooks, all joint blocks, the runtime, and lm-eval without downloads."""
+
+    from lm_eval.api.instance import Instance
+    from lm_eval.models.huggingface import HFLM
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+
+    torch.manual_seed(11)
+    vocab = {"<pad>": 0, "<eos>": 1, "<unk>": 2}
+    vocab.update({f"t{index}": index + 3 for index in range(125)})
+    tokenizer_backend = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer_backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_backend,
+        pad_token="<pad>",
+        eos_token="<eos>",
+        unk_token="<unk>",
+    )
+    model_config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=24,
+        intermediate_size=48,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=6,
+        max_position_embeddings=64,
+        pad_token_id=0,
+        eos_token_id=1,
+    )
+    model = Qwen3ForCausalLM(model_config).float().eval()
+    batches = [
+        {
+            "input_ids": torch.randint(3, 128, (2, 8)),
+            "attention_mask": torch.ones(2, 8, dtype=torch.long),
+        }
+    ]
+    hidden, kwargs = capture_first_layer_inputs(model, batches, torch.device("cpu"))
+    config = QuantConfig(
+        bits=4,
+        activation_bits=8,
+        rank=2,
+        beta=0.5,
+        group_size=8,
+        block_size=8,
+        outer_iters=1,
+        d_mode="closed_form",
+        d_steps=0,
+        svd_mode="exact",
+    )
+    states = quantize_qwen_model(
+        model,
+        hidden,
+        kwargs,
+        torch.device("cpu"),
+        config,
+        cache_tokens=16,
+        hessian_block_size=16,
+        max_layers=1,
+    )
+    wrapped = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=1, backend="causal", max_length=32)
+    request = Instance(
+        request_type="loglikelihood",
+        doc={},
+        arguments=("t3 t4", " t5"),
+        idx=0,
+        metadata=("smoke", 0, 1),
+    )
+    result = wrapped.loglikelihood([request])
+    assert len(states) == 7
+    assert len(result) == 1 and math.isfinite(result[0][0])
+    print(json.dumps({"status": "ok", "quantized_modules": len(states), "loglikelihood": result[0][0]}, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1025,6 +1102,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     self_test = subparsers.add_parser("self-test", help="run a dependency-light numerical smoke test")
     self_test.set_defaults(func=self_test_command)
+    integration_test = subparsers.add_parser(
+        "integration-test", help="run a tiny random-Qwen3 plus lm-eval integration test"
+    )
+    integration_test.set_defaults(func=integration_test_command)
     return parser
 
 

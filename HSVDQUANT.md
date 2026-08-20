@@ -22,6 +22,7 @@ source .venv/bin/activate
 pip install -U pip
 pip install -r requirements-hsvdquant.txt
 python hsvdquant.py self-test
+python hsvdquant.py integration-test
 ```
 
 Qwen3 support requires Transformers 4.52.4 or newer. The compact checkpoint references the base
