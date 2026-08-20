@@ -1,0 +1,5 @@
+.toy-venv/
+__pycache__/
+.venv/
+outputs/
+*.pyc

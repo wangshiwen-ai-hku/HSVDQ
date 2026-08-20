@@ -59,6 +59,16 @@ We propose an optimization-based framework for LUT-based post-training non-unifo
 
 ## Usage
 
+### H-SVDQuant on Qwen3
+
+The new [`hsvdquant.py`](hsvdquant.py) entry point implements streaming calibration and joint
+optimization of smoothing `D`, the FP low-rank factors `L1/L2`, and GPTQ integer residual codes
+`Z`. It can quantize `Qwen/Qwen3-0.6B`, save a reloadable compact checkpoint, and pass the live
+W4A4 model directly to lm-eval-harness.
+
+See [`HSVDQUANT.md`](HSVDQUANT.md) for environment setup, smoke tests, full 512-sample calibration,
+checkpoint reload, and downstream evaluation commands.
+
 1. **Prerequisites**
     
     First, install the required Python dependencies:    
