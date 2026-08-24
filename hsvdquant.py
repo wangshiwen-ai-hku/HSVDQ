@@ -46,6 +46,7 @@ class QuantConfig:
     code_objective: str = "fw"
     joint_code_iters: int = 1
     block_input_mode: str = "quantized"
+    intra_block_mode: str = "sequential"
     linear_objective: str = "local"
     ablation_mode: str = "custom"
     trajectory_damp: float = 0.1
@@ -54,6 +55,15 @@ class QuantConfig:
     trajectory_diagnostics: bool = False
     trajectory_start_layer: int = 0
     trajectory_rebase: bool = False
+    trajectory_holdout_fraction: float = 0.0
+    trajectory_holdout_backtracking: bool = False
+    trajectory_backtrack_scales: tuple[float, ...] = (0.0, 0.125, 0.25, 0.5, 1.0)
+    trajectory_spectral_floor: float = 0.0
+    trajectory_min_holdout_gain: float = 0.0
+    trajectory_min_direction_cosine: float = -1.0
+    trajectory_quantized_gate: bool = False
+    trajectory_module_filter: str = "all"
+    trajectory_oracle_diagnostics: bool = False
     beta: float = 0.5
     p: float = 2.0
     group_size: int = 128
@@ -90,6 +100,8 @@ class QuantConfig:
             raise ValueError("joint_code_iters must be >= 1")
         if self.block_input_mode not in {"quantized", "reference"}:
             raise ValueError("block_input_mode must be quantized or reference")
+        if self.intra_block_mode not in {"sequential", "fp_independent"}:
+            raise ValueError("intra_block_mode must be sequential or fp_independent")
         if self.linear_objective not in {"local", "cumulative"}:
             raise ValueError("linear_objective must be local or cumulative")
         if self.ablation_mode not in {"custom", "v1", "v2", "v3", "v2v3"}:
@@ -102,6 +114,16 @@ class QuantConfig:
             raise ValueError("trajectory_scale must be in (0, 1]")
         if self.trajectory_start_layer < 0:
             raise ValueError("trajectory_start_layer must be non-negative")
+        if not 0 <= self.trajectory_holdout_fraction < 1:
+            raise ValueError("trajectory_holdout_fraction must be in [0, 1)")
+        if not self.trajectory_backtrack_scales:
+            raise ValueError("trajectory_backtrack_scales must be non-empty")
+        if any(scale < 0 for scale in self.trajectory_backtrack_scales):
+            raise ValueError("trajectory_backtrack_scales must be non-negative")
+        if self.trajectory_spectral_floor < 0:
+            raise ValueError("trajectory_spectral_floor must be non-negative")
+        if self.trajectory_module_filter not in {"all", "attention", "mlp", "down_proj"}:
+            raise ValueError("trajectory_module_filter must be all, attention, mlp, or down_proj")
         if self.code_objective == "joint" and self.rank_a > 0:
             raise ValueError("joint code optimization supersedes rank splitting; set rank_a=0")
         if self.p < 1:
@@ -693,6 +715,83 @@ def _quantize_activation(inputs: torch.Tensor, bits: int, group_size: int = 0) -
     return quantized[..., :columns] if pad else quantized
 
 
+def _mse(left: torch.Tensor, right: torch.Tensor) -> float:
+    return float((left - right).square().mean().item())
+
+
+def _safe_gain(before: float, after: float) -> float:
+    return (before - after) / max(before, 1e-30)
+
+
+def _split_fit_holdout(
+    xhat: torch.Tensor,
+    xref: torch.Tensor,
+    fraction: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    rows = xhat.shape[0]
+    holdout_rows = int(rows * fraction)
+    if holdout_rows <= 0 or rows - holdout_rows < 2:
+        return xhat, xref, None, None
+    # Deterministic interleaving keeps token positions spread across the cache.
+    holdout_index = torch.linspace(0, rows - 1, holdout_rows, device=xhat.device).round().long().unique()
+    mask = torch.ones(rows, device=xhat.device, dtype=torch.bool)
+    mask[holdout_index] = False
+    if int(mask.sum().item()) < 2 or holdout_index.numel() < 1:
+        return xhat, xref, None, None
+    return xhat[mask], xref[mask], xhat[holdout_index], xref[holdout_index]
+
+
+def _trajectory_metric_diagnostics(hessian: torch.Tensor, spectral_floor: float) -> dict[str, float]:
+    eigvals = torch.linalg.eigvalsh(_sym(hessian)).clamp_min(0)
+    total = eigvals.sum().clamp_min(1e-30)
+    max_eig = eigvals[-1].clamp_min(1e-30)
+    positive = eigvals[eigvals > max_eig * 1e-8]
+    threshold = max_eig * float(spectral_floor)
+    weak = eigvals <= threshold if spectral_floor > 0 else eigvals <= max_eig * 1e-8
+    probs = eigvals / total
+    entropy = -(probs[probs > 0] * probs[probs > 0].log()).sum()
+    return {
+        "hessian_lambda_max": float(max_eig.item()),
+        "hessian_lambda_min_pos": float(positive[0].item()) if positive.numel() else 0.0,
+        "hessian_condition": float((max_eig / positive[0]).item()) if positive.numel() else float("inf"),
+        "effective_rank": float(entropy.exp().item()),
+        "weak_subspace_energy_share": float((eigvals[weak].sum() / total).item()),
+        "weak_subspace_dim": float(weak.sum().item()),
+    }
+
+
+def _solve_trajectory_direction(
+    xhat: torch.Tensor,
+    delta: torch.Tensor,
+    damp: float,
+    spectral_floor: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    hessian = _sym(xhat.T @ xhat / float(max(1, xhat.shape[0])))
+    cross = xhat.T @ delta / float(max(1, xhat.shape[0]))
+    diagnostics = _trajectory_metric_diagnostics(hessian, spectral_floor)
+    if spectral_floor > 0:
+        eigvals, eigvecs = torch.linalg.eigh(hessian)
+        eigvals = eigvals.clamp_min(0)
+        max_eig = eigvals[-1].clamp_min(1e-30)
+        keep = eigvals >= max_eig * float(spectral_floor)
+        filtered = eigvecs @ (keep.to(cross.dtype)[:, None] * (eigvecs.T @ cross))
+        diagnostics["spectral_kept_dim"] = float(keep.sum().item())
+        diagnostics["spectral_dropped_dim"] = float((~keep).sum().item())
+        cross = filtered
+    else:
+        diagnostics["spectral_kept_dim"] = float(hessian.shape[0])
+        diagnostics["spectral_dropped_dim"] = 0.0
+    direction = torch.linalg.solve(_regularize_hessian(hessian, damp), cross)
+    return direction, diagnostics
+
+
+def _direction_cosine(left: torch.Tensor, right: torch.Tensor) -> float:
+    denom = left.norm() * right.norm()
+    if float(denom.item()) <= 1e-30:
+        return 0.0
+    return float(((left * right).sum() / denom).item())
+
+
 @torch.no_grad()
 def cumulative_target_weight(
     layer: nn.Linear,
@@ -724,21 +823,53 @@ def cumulative_target_weight(
             f"paired cumulative caches must have equal shapes, got {tuple(xhat.shape)} and {tuple(xref.shape)}"
         )
     weight = layer.weight.detach().T.float()
-    target_outputs = xref @ weight
-    upstream_delta = target_outputs - xhat @ weight
-    paired_hessian = _sym(xhat.T @ xhat / float(max(1, xhat.shape[0])))
-    cross = xhat.T @ upstream_delta / float(max(1, xhat.shape[0]))
-    direction = torch.linalg.solve(
-        _regularize_hessian(paired_hessian, config.trajectory_damp),
-        cross,
+    fit_xhat, fit_xref, holdout_xhat, holdout_xref = _split_fit_holdout(
+        xhat,
+        xref,
+        config.trajectory_holdout_fraction if config.trajectory_diagnostics else 0.0,
     )
-    direction_output = xhat @ direction
+    fit_target_outputs = fit_xref @ weight
+    fit_upstream_delta = fit_target_outputs - fit_xhat @ weight
+    direction, metric_diagnostics = _solve_trajectory_direction(
+        fit_xhat,
+        fit_upstream_delta,
+        config.trajectory_damp,
+        config.trajectory_spectral_floor,
+    )
+    direction_output = fit_xhat @ direction
     denominator = direction_output.square().sum().clamp_min(1e-30)
     line_scale = (
-        (upstream_delta * direction_output).sum() / denominator
+        (fit_upstream_delta * direction_output).sum() / denominator
     ).clamp(0.0, 1.0)
     line_scale = line_scale * float(config.trajectory_scale)
-    correction = direction * line_scale
+    raw_line_correction = direction * line_scale
+
+    full_target_outputs = xref @ weight
+    full_upstream_delta = full_target_outputs - xhat @ weight
+    upstream_mse = float(full_upstream_delta.square().mean().item())
+    line_projected_mse = _mse(xhat @ (weight + raw_line_correction), full_target_outputs)
+
+    holdout_upstream_mse = None
+    holdout_projected_mse = None
+    holdout_best_scale = 1.0
+    if holdout_xhat is not None and holdout_xref is not None:
+        holdout_target_outputs = holdout_xref @ weight
+        holdout_upstream_delta = holdout_target_outputs - holdout_xhat @ weight
+        holdout_upstream_mse = float(holdout_upstream_delta.square().mean().item())
+        scale_errors = []
+        for scale in config.trajectory_backtrack_scales:
+            candidate = weight + raw_line_correction * float(scale)
+            scale_errors.append((float(scale), _mse(holdout_xhat @ candidate, holdout_target_outputs)))
+        if config.trajectory_holdout_backtracking:
+            holdout_best_scale, holdout_projected_mse = min(scale_errors, key=lambda item: item[1])
+        else:
+            holdout_projected_mse = _mse(
+                holdout_xhat @ (weight + raw_line_correction),
+                holdout_target_outputs,
+            )
+            holdout_best_scale = 1.0
+    correction = raw_line_correction * holdout_best_scale
+
     raw_norm_ratio = correction.norm().div(weight.norm().clamp_min(1e-20))
     trust_scale = min(
         1.0,
@@ -746,25 +877,97 @@ def cumulative_target_weight(
     )
     correction = correction * trust_scale
     target_weight = weight + correction
-    projected_mse = float((xhat @ target_weight - target_outputs).square().mean().item())
-    upstream_mse = float(upstream_delta.square().mean().item())
+    projected_mse = _mse(xhat @ target_weight, full_target_outputs)
+    accepted_holdout_mse = None
+    if holdout_xhat is not None and holdout_xref is not None:
+        accepted_holdout_mse = _mse(holdout_xhat @ target_weight, holdout_xref @ weight)
+
+    split_direction_cosine = 1.0
+    split_norm_ratio = 1.0
+    if config.trajectory_diagnostics and fit_xhat.shape[0] >= 4:
+        even_xhat = fit_xhat[0::2]
+        odd_xhat = fit_xhat[1::2]
+        even_xref = fit_xref[0::2]
+        odd_xref = fit_xref[1::2]
+        if even_xhat.shape[0] >= 2 and odd_xhat.shape[0] >= 2:
+            even_target = even_xref @ weight
+            odd_target = odd_xref @ weight
+            even_dir, _ = _solve_trajectory_direction(
+                even_xhat,
+                even_target - even_xhat @ weight,
+                config.trajectory_damp,
+                config.trajectory_spectral_floor,
+            )
+            odd_dir, _ = _solve_trajectory_direction(
+                odd_xhat,
+                odd_target - odd_xhat @ weight,
+                config.trajectory_damp,
+                config.trajectory_spectral_floor,
+            )
+            split_direction_cosine = _direction_cosine(even_dir, odd_dir)
+            split_norm_ratio = float(
+                min(even_dir.norm(), odd_dir.norm()).div(
+                    max(even_dir.norm(), odd_dir.norm()).clamp_min(1e-30)
+                ).item()
+            )
+
     if projected_mse > upstream_mse * (1.0 + 1e-5):
         # Numerical guard: W (zero correction) is always a feasible candidate.
         correction.zero_()
         target_weight = weight
         projected_mse = upstream_mse
+        if holdout_upstream_mse is not None:
+            accepted_holdout_mse = holdout_upstream_mse
+
+    holdout_gain = (
+        _safe_gain(holdout_upstream_mse, accepted_holdout_mse)
+        if holdout_upstream_mse is not None and accepted_holdout_mse is not None
+        else 0.0
+    )
+    cap_headroom = float(raw_norm_ratio.item()) / max(float(config.trajectory_max_norm_ratio), 1e-30)
     diagnostics = {
         "upstream_mse": upstream_mse,
         "projected_mse": projected_mse,
+        "line_projected_mse": line_projected_mse,
+        "stabilization_gap": (line_projected_mse - projected_mse) / max(upstream_mse, 1e-30),
+        "holdout_upstream_mse": float(holdout_upstream_mse) if holdout_upstream_mse is not None else 0.0,
+        "holdout_projected_mse": float(accepted_holdout_mse) if accepted_holdout_mse is not None else 0.0,
+        "holdout_gain": holdout_gain,
+        "holdout_best_scale": float(holdout_best_scale),
         "correction_norm_ratio": float(
             correction.norm().div(weight.norm().clamp_min(1e-20)).item()
         ),
         "raw_correction_norm_ratio": float(raw_norm_ratio.item()),
+        "cap_headroom": cap_headroom,
         "correction_line_scale": float(line_scale.item()),
         "correction_trust_scale": float(trust_scale),
         "correction_relative_gain": (upstream_mse - projected_mse) / max(upstream_mse, 1e-30),
+        "split_direction_cosine": split_direction_cosine,
+        "split_norm_ratio": split_norm_ratio,
+        **metric_diagnostics,
     }
-    return target_weight, target_outputs, diagnostics
+    if config.trajectory_oracle_diagnostics:
+        try:
+            oracle = torch.linalg.lstsq(xhat, full_target_outputs).solution
+            oracle_mse = _mse(xhat @ oracle, full_target_outputs)
+            diagnostics.update(
+                {
+                    "oracle_projected_mse": oracle_mse,
+                    "j_irr_mse": oracle_mse,
+                    "oracle_projection_gain": _safe_gain(upstream_mse, oracle_mse),
+                    "oracle_to_projected_gap": (projected_mse - oracle_mse) / max(upstream_mse, 1e-30),
+                }
+            )
+        except RuntimeError:
+            diagnostics.update(
+                {
+                    "oracle_projected_mse": 0.0,
+                    "j_irr_mse": 0.0,
+                    "oracle_projection_gain": 0.0,
+                    "oracle_to_projected_gap": 0.0,
+                }
+            )
+    return target_weight, full_target_outputs, diagnostics
 
 
 def _state_error(
@@ -1098,6 +1301,46 @@ def _qwen_sequential_groups(layer: nn.Module) -> list[list[str]]:
     return groups
 
 
+def _trajectory_module_allowed(name: str, config: QuantConfig) -> bool:
+    if config.trajectory_module_filter == "all":
+        return True
+    if config.trajectory_module_filter == "down_proj":
+        return name.endswith("down_proj")
+    if config.trajectory_module_filter == "mlp":
+        return any(name.endswith(kind) for kind in ("gate_proj", "up_proj", "down_proj"))
+    if config.trajectory_module_filter == "attention":
+        return any(name.endswith(kind) for kind in ("q_proj", "k_proj", "v_proj", "o_proj"))
+    return True
+
+
+def _state_error_from_state(
+    original_weight: torch.Tensor,
+    hessian: torch.Tensor,
+    cached_x: torch.Tensor | None,
+    state: dict[str, Any],
+    target_outputs: torch.Tensor | None,
+) -> float:
+    device = original_weight.device
+    d = state["d"].to(device=device, dtype=torch.float32)
+    l1 = state["l1"].to(device=device, dtype=torch.float32)
+    l2 = state["l2"].to(device=device, dtype=torch.float32)
+    codes = state["codes"].to(device=device)
+    scales = state["scales"].to(device=device, dtype=torch.float32)
+    quantized_residual = _dequantize_codes(codes, scales, int(state["group_size"])).T.contiguous()
+    return _state_error(
+        original_weight,
+        hessian,
+        cached_x,
+        d,
+        l1,
+        l2,
+        quantized_residual,
+        int(state["activation_bits"]),
+        int(state.get("activation_group_size", 0)),
+        target_outputs,
+    )
+
+
 class _StopForward(RuntimeError):
     pass
 
@@ -1164,7 +1407,9 @@ def _paired_batch_stats(
     return {
         "mse": mse,
         "teacher_energy": teacher_mse,
+        "student_energy": student_energy / float(max(1, elements)),
         "nmse": mse / max(teacher_mse, 1e-30),
+        "student_normalized_mse": mse / max(student_energy / float(max(1, elements)), 1e-30),
         "cosine": inner_product / max(math.sqrt(student_energy * teacher_energy), 1e-30),
     }
 
@@ -1227,15 +1472,23 @@ def quantize_qwen_model(
         if need_reference_path:
             handles = []
             if trajectory_active:
+                module_offset = 0
                 for group in sequential_groups:
                     for offset, name in enumerate(group):
                         module = _get_submodule(layer, name)
+                        cache_seed = seed + layer_index * 100 + (
+                            module_offset
+                            if config.intra_block_mode == "fp_independent"
+                            else offset
+                        )
                         cache = ActivationCache(
                             module.in_features,
                             cache_tokens,
-                            seed + layer_index * 100 + offset,
+                            cache_seed,
                         )
                         reference_collectors[name] = cache
+                        if config.intra_block_mode == "fp_independent":
+                            module_offset += 1
 
                         def reference_hook(
                             _module: nn.Module,
@@ -1269,69 +1522,173 @@ def quantize_qwen_model(
             if need_reference_path
             else None
         )
-        for group in sequential_groups:
-            collectors: dict[str, ActivationStats] = {}
-            handles = []
-            for offset, name in enumerate(group):
-                module = _get_submodule(layer, name)
-                stats = ActivationStats(
-                    module.in_features,
-                    device,
-                    cache_tokens,
-                    hessian_block_size,
-                    seed + layer_index * 100 + offset,
+
+        def quantize_module(
+            layer_index: int,
+            name: str,
+            module: nn.Linear,
+            hessian: torch.Tensor,
+            cached_x: torch.Tensor | None,
+        ) -> dict[str, Any]:
+            started = time.time()
+            target_weight = None
+            target_outputs = None
+            objective_diagnostics = None
+            module_trajectory_active = trajectory_active and _trajectory_module_allowed(name, config)
+            if trajectory_active and not module_trajectory_active:
+                objective_diagnostics = {
+                    "trajectory_skipped_by_filter": 1.0,
+                    "trajectory_quantized_acceptance": 0.0,
+                }
+            if module_trajectory_active:
+                if cached_x is None:
+                    raise ValueError("cumulative linear objective requires --activation-cache-tokens > 0")
+                reference_x = reference_collectors[name].finalize()
+                target_weight, target_outputs, objective_diagnostics = cumulative_target_weight(
+                    module,
+                    hessian,
+                    cached_x,
+                    reference_x,
+                    config,
                 )
-                collectors[name] = stats
-
-                def hook(_module: nn.Module, args: tuple[Any, ...], _output: Any, target=stats) -> None:
-                    target.add_batch(args[0])
-
-                handles.append(module.register_forward_hook(hook))
-
-            for hidden, kwargs in zip(block_hidden_batches, layer_kwargs, strict=True):
-                layer(hidden.to(device), **_move_tree(kwargs, device))
-            for handle in handles:
-                handle.remove()
-
-            for name in group:
-                module = _get_submodule(layer, name)
-                hessian, cached_x = collectors[name].finalize()
-                started = time.time()
-                target_weight = None
-                target_outputs = None
-                objective_diagnostics = None
-                if trajectory_active:
-                    if cached_x is None:
-                        raise ValueError("cumulative linear objective requires --activation-cache-tokens > 0")
-                    reference_x = reference_collectors[name].finalize()
-                    target_weight, target_outputs, objective_diagnostics = cumulative_target_weight(
-                        module,
-                        hessian,
-                        cached_x,
-                        reference_x,
-                        config,
-                    )
-                state = joint_quantize_linear(
+                reliable = (
+                    objective_diagnostics.get("holdout_gain", 0.0)
+                    >= config.trajectory_min_holdout_gain
+                    and objective_diagnostics.get("split_direction_cosine", 1.0)
+                    >= config.trajectory_min_direction_cosine
+                )
+                if not reliable:
+                    objective_diagnostics["trajectory_reliability_reject"] = 1.0
+                    target_weight = None
+                    target_outputs = None
+                else:
+                    objective_diagnostics["trajectory_reliability_reject"] = 0.0
+            local_state = None
+            if (
+                module_trajectory_active
+                and config.trajectory_quantized_gate
+                and target_outputs is not None
+            ):
+                local_state = joint_quantize_linear(
                     module,
                     hessian,
                     cached_x,
                     config,
-                    target_weight=target_weight,
-                    target_outputs=target_outputs,
-                    objective_diagnostics=objective_diagnostics,
                 )
-                full_name = f"model.layers.{layer_index}.{name}"
-                states[full_name] = state
+            state = joint_quantize_linear(
+                module,
+                hessian,
+                cached_x,
+                config,
+                target_weight=target_weight,
+                target_outputs=target_outputs,
+                objective_diagnostics=objective_diagnostics,
+            )
+            if local_state is not None and target_outputs is not None:
+                local_teacher_error = _state_error_from_state(
+                    module.weight.detach().T.float(),
+                    hessian.to(device=device, dtype=torch.float32),
+                    cached_x,
+                    local_state,
+                    target_outputs,
+                )
+                state["objective_diagnostics"]["local_teacher_error"] = float(local_teacher_error)
+                state["objective_diagnostics"]["trajectory_teacher_error"] = float(state["error"])
+                if state["error"] <= local_teacher_error * (1.0 - config.trajectory_min_holdout_gain):
+                    state["objective_diagnostics"]["trajectory_quantized_acceptance"] = 1.0
+                else:
+                    local_state["objective_diagnostics"] = dict(state["objective_diagnostics"])
+                    local_state["objective_diagnostics"]["trajectory_quantized_acceptance"] = 0.0
+                    local_state["objective_diagnostics"]["trajectory_quantized_reverted"] = 1.0
+                    local_state["error"] = float(local_teacher_error)
+                    state = local_state
+            full_name = f"model.layers.{layer_index}.{name}"
+            states[full_name] = state
+            print(
+                f"  {name}: best_mse={state['error']:.6e}, "
+                f"iter={state['outer_iteration']}, time={time.time() - started:.1f}s",
+                flush=True,
+            )
+            return state
+
+        if config.intra_block_mode == "fp_independent":
+            collectors: dict[str, ActivationStats] = {}
+            handles = []
+            module_offset = 0
+            calibration_batches = (
+                propagated_hidden_batches
+                if config.linear_objective == "cumulative"
+                else block_hidden_batches
+            )
+            for group in sequential_groups:
+                for name in group:
+                    module = _get_submodule(layer, name)
+                    stats = ActivationStats(
+                        module.in_features,
+                        device,
+                        cache_tokens,
+                        hessian_block_size,
+                        seed + layer_index * 100 + module_offset,
+                    )
+                    collectors[name] = stats
+                    module_offset += 1
+
+                    def hook(_module: nn.Module, args: tuple[Any, ...], _output: Any, target=stats) -> None:
+                        target.add_batch(args[0])
+
+                    handles.append(module.register_forward_hook(hook))
+            for hidden, kwargs in zip(calibration_batches, layer_kwargs, strict=True):
+                layer(hidden.to(device), **_move_tree(kwargs, device))
+            for handle in handles:
+                handle.remove()
+
+            pending: list[tuple[str, nn.Linear, dict[str, Any]]] = []
+            for group in sequential_groups:
+                for name in group:
+                    module = _get_submodule(layer, name)
+                    hessian, cached_x = collectors[name].finalize()
+                    state = quantize_module(layer_index, name, module, hessian, cached_x)
+                    pending.append((name, module, state))
+                    collectors[name].free()
+                    if name in reference_collectors:
+                        reference_collectors[name].free()
+            for name, module, state in pending:
                 replacement = HSVQuantLinear(state, compute_dtype=module.weight.dtype).to(device)
                 _set_submodule(layer, name, replacement)
-                collectors[name].free()
-                if name in reference_collectors:
-                    reference_collectors[name].free()
-                print(
-                    f"  {name}: best_mse={state['error']:.6e}, "
-                    f"iter={state['outer_iteration']}, time={time.time() - started:.1f}s",
-                    flush=True,
-                )
+        else:
+            for group in sequential_groups:
+                collectors = {}
+                handles = []
+                for offset, name in enumerate(group):
+                    module = _get_submodule(layer, name)
+                    stats = ActivationStats(
+                        module.in_features,
+                        device,
+                        cache_tokens,
+                        hessian_block_size,
+                        seed + layer_index * 100 + offset,
+                    )
+                    collectors[name] = stats
+
+                    def hook(_module: nn.Module, args: tuple[Any, ...], _output: Any, target=stats) -> None:
+                        target.add_batch(args[0])
+
+                    handles.append(module.register_forward_hook(hook))
+
+                for hidden, kwargs in zip(block_hidden_batches, layer_kwargs, strict=True):
+                    layer(hidden.to(device), **_move_tree(kwargs, device))
+                for handle in handles:
+                    handle.remove()
+
+                for name in group:
+                    module = _get_submodule(layer, name)
+                    hessian, cached_x = collectors[name].finalize()
+                    state = quantize_module(layer_index, name, module, hessian, cached_x)
+                    replacement = HSVQuantLinear(state, compute_dtype=module.weight.dtype).to(device)
+                    _set_submodule(layer, name, replacement)
+                    collectors[name].free()
+                    if name in reference_collectors:
+                        reference_collectors[name].free()
 
         if config.block_input_mode == "quantized":
             next_hidden: list[torch.Tensor] = []
@@ -1366,6 +1723,14 @@ def quantize_qwen_model(
                 "output_mse": output_mse,
                 "input_nmse": input_nmse,
                 "output_nmse": output_nmse,
+                "input_teacher_energy": float(block_input_stats["teacher_energy"] if block_input_stats else 0.0),
+                "input_student_energy": float(block_input_stats["student_energy"] if block_input_stats else 0.0),
+                "output_teacher_energy": float(block_output_stats["teacher_energy"]),
+                "output_student_energy": float(block_output_stats["student_energy"]),
+                "input_student_normalized_mse": float(
+                    block_input_stats["student_normalized_mse"] if block_input_stats else 0.0
+                ),
+                "output_student_normalized_mse": float(block_output_stats["student_normalized_mse"]),
                 "input_cosine": float(block_input_stats["cosine"] if block_input_stats else 1.0),
                 "output_cosine": float(block_output_stats["cosine"]),
                 "target_output_nmse": float(target_output_stats["nmse"]),
@@ -1563,6 +1928,7 @@ def _resolve_ablation_mode(args: argparse.Namespace) -> dict[str, Any]:
         "code_objective": args.code_objective,
         "joint_code_iters": args.joint_code_iters,
         "block_input_mode": args.block_input_mode,
+        "intra_block_mode": args.intra_block_mode,
         "linear_objective": args.linear_objective,
         "activation_weight": args.activation_weight,
     }
@@ -1610,6 +1976,7 @@ def quantize_command(args: argparse.Namespace) -> None:
         code_objective=ablation["code_objective"],
         joint_code_iters=ablation["joint_code_iters"],
         block_input_mode=ablation["block_input_mode"],
+        intra_block_mode=args.intra_block_mode,
         linear_objective=ablation["linear_objective"],
         ablation_mode=args.ablation_mode,
         trajectory_damp=args.trajectory_damp,
@@ -1618,6 +1985,15 @@ def quantize_command(args: argparse.Namespace) -> None:
         trajectory_diagnostics=args.trajectory_diagnostics,
         trajectory_start_layer=args.trajectory_start_layer,
         trajectory_rebase=args.trajectory_rebase,
+        trajectory_holdout_fraction=args.trajectory_holdout_fraction,
+        trajectory_holdout_backtracking=args.trajectory_holdout_backtracking,
+        trajectory_backtrack_scales=tuple(args.trajectory_backtrack_scales),
+        trajectory_spectral_floor=args.trajectory_spectral_floor,
+        trajectory_min_holdout_gain=args.trajectory_min_holdout_gain,
+        trajectory_min_direction_cosine=args.trajectory_min_direction_cosine,
+        trajectory_quantized_gate=args.trajectory_quantized_gate,
+        trajectory_module_filter=args.trajectory_module_filter,
+        trajectory_oracle_diagnostics=args.trajectory_oracle_diagnostics,
         beta=args.beta,
         p=args.p,
         group_size=args.group_size,
@@ -1638,6 +2014,7 @@ def quantize_command(args: argparse.Namespace) -> None:
         "[H-SVDQuant] resolved ablation "
         f"mode={config.ablation_mode}, code={config.code_objective}, "
         f"trajectory={config.linear_objective}, lambda={config.activation_weight:g}, "
+        f"block_input={config.block_input_mode}, intra_block={config.intra_block_mode}, "
         f"W{config.bits}A{config.activation_bits}, "
         f"trajectory_damp={config.trajectory_damp:g}, "
         f"trajectory_clip={config.trajectory_max_norm_ratio:g}",
@@ -1908,6 +2285,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="quantized: propagate each quantized block output as the next block cache; reference: use FP block inputs",
     )
     quantize.add_argument(
+        "--intra-block-mode",
+        choices=["sequential", "fp_independent"],
+        default="sequential",
+        help="sequential: quantize/replace within block in qkv->o, gate/up->down order; "
+        "fp_independent: calibrate every linear on one FP block forward, then replace all",
+    )
+    quantize.add_argument(
         "--linear-objective",
         choices=["local", "cumulative"],
         default="local",
@@ -1955,6 +2339,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--trajectory-rebase",
         action="store_true",
         help="at the start layer, seed the optimization teacher with the current student hidden state",
+    )
+    quantize.add_argument(
+        "--trajectory-holdout-fraction",
+        type=float,
+        default=0.0,
+        help="fraction of paired cache rows held out for trajectory correction validation",
+    )
+    quantize.add_argument(
+        "--trajectory-holdout-backtracking",
+        action="store_true",
+        help="choose the trajectory correction scale on the holdout split instead of taking the full line-search step",
+    )
+    quantize.add_argument(
+        "--trajectory-backtrack-scales",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.125, 0.25, 0.5, 1.0],
+        help="candidate correction scales for holdout backtracking",
+    )
+    quantize.add_argument(
+        "--trajectory-spectral-floor",
+        type=float,
+        default=0.0,
+        help="drop trajectory correction components below this relative Hessian eigenvalue floor",
+    )
+    quantize.add_argument(
+        "--trajectory-min-holdout-gain",
+        type=float,
+        default=0.0,
+        help="minimum held-out teacher-MSE gain required to accept a trajectory correction",
+    )
+    quantize.add_argument(
+        "--trajectory-min-direction-cosine",
+        type=float,
+        default=-1.0,
+        help="minimum split-half correction cosine required to accept a trajectory correction",
+    )
+    quantize.add_argument(
+        "--trajectory-quantized-gate",
+        action="store_true",
+        help="quantize both local and trajectory targets, then keep trajectory only if its teacher MSE improves",
+    )
+    quantize.add_argument(
+        "--trajectory-module-filter",
+        choices=["all", "attention", "mlp", "down_proj"],
+        default="all",
+        help="limit cumulative trajectory correction to a subset of linear module types",
+    )
+    quantize.add_argument(
+        "--trajectory-oracle-diagnostics",
+        action="store_true",
+        help="compute expensive least-squares projection lower-bound diagnostics on paired caches",
     )
     quantize.add_argument("--beta", type=float, default=0.5)
     quantize.add_argument("--p", type=float, default=2.0)
