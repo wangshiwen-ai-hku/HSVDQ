@@ -18,10 +18,13 @@ This is a research implementation.  Integer codes are stored compactly as int8
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
+import os
 import random
 import time
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -35,7 +38,22 @@ import torch.nn.functional as F
 class QuantConfig:
     bits: int = 4
     activation_bits: int = 4
+    activation_group_size: int = 0
+    d_fa_group_size: int = -1
     rank: int = 8
+    rank_a: int = 0
+    rank_a_mode: str = "fixed"
+    code_objective: str = "fw"
+    joint_code_iters: int = 1
+    block_input_mode: str = "quantized"
+    linear_objective: str = "local"
+    ablation_mode: str = "custom"
+    trajectory_damp: float = 0.1
+    trajectory_max_norm_ratio: float = 0.25
+    trajectory_scale: float = 1.0
+    trajectory_diagnostics: bool = False
+    trajectory_start_layer: int = 0
+    trajectory_rebase: bool = False
     beta: float = 0.5
     p: float = 2.0
     group_size: int = 128
@@ -56,8 +74,36 @@ class QuantConfig:
             raise ValueError("bits must be in [2, 8]")
         if self.activation_bits < 2 and self.activation_bits != 16:
             raise ValueError("activation_bits must be >=2, or 16 to disable activation quantization")
+        if self.activation_group_size < 0:
+            raise ValueError("activation_group_size must be non-negative (0 = per-token global max)")
+        if self.d_fa_group_size < -1:
+            raise ValueError("d_fa_group_size must be >=-1 (-1 = inherit activation_group_size)")
         if self.rank < 0:
             raise ValueError("rank must be non-negative")
+        if not 0 <= self.rank_a <= self.rank:
+            raise ValueError("rank_a must satisfy 0 <= rank_a <= rank")
+        if self.rank_a_mode not in {"fixed", "gated"}:
+            raise ValueError("rank_a_mode must be fixed or gated")
+        if self.code_objective not in {"fw", "joint"}:
+            raise ValueError("code_objective must be fw or joint")
+        if self.joint_code_iters < 1:
+            raise ValueError("joint_code_iters must be >= 1")
+        if self.block_input_mode not in {"quantized", "reference"}:
+            raise ValueError("block_input_mode must be quantized or reference")
+        if self.linear_objective not in {"local", "cumulative"}:
+            raise ValueError("linear_objective must be local or cumulative")
+        if self.ablation_mode not in {"custom", "v1", "v2", "v3", "v2v3"}:
+            raise ValueError("ablation_mode must be custom, v1, v2, v3, or v2v3")
+        if self.trajectory_damp < 0:
+            raise ValueError("trajectory_damp must be non-negative")
+        if self.trajectory_max_norm_ratio <= 0:
+            raise ValueError("trajectory_max_norm_ratio must be positive")
+        if not 0 < self.trajectory_scale <= 1:
+            raise ValueError("trajectory_scale must be in (0, 1]")
+        if self.trajectory_start_layer < 0:
+            raise ValueError("trajectory_start_layer must be non-negative")
+        if self.code_objective == "joint" and self.rank_a > 0:
+            raise ValueError("joint code optimization supersedes rank splitting; set rank_a=0")
         if self.p < 1:
             raise ValueError("p must be >= 1")
         if self.outer_iters < 1:
@@ -161,6 +207,46 @@ class ActivationStats:
         self._priorities = None
 
 
+class ActivationCache:
+    """Bounded activation reservoir using the same sampling as ActivationStats."""
+
+    def __init__(self, columns: int, cache_tokens: int, seed: int = 0) -> None:
+        self.columns = columns
+        self.cache_tokens = max(0, cache_tokens)
+        self._cache: torch.Tensor | None = None
+        self._priorities: torch.Tensor | None = None
+        self._generator = torch.Generator(device="cpu")
+        self._generator.manual_seed(seed)
+
+    @torch.no_grad()
+    def add_batch(self, inputs: torch.Tensor) -> None:
+        rows = inputs.detach().reshape(-1, inputs.shape[-1])
+        if rows.shape[1] != self.columns:
+            raise ValueError(f"expected {self.columns} columns, got {rows.shape[1]}")
+        if self.cache_tokens == 0:
+            return
+        cpu_rows = rows.to(device="cpu", dtype=torch.float16)
+        priorities = torch.rand(cpu_rows.shape[0], generator=self._generator)
+        if self._cache is not None:
+            cpu_rows = torch.cat((self._cache, cpu_rows), dim=0)
+            priorities = torch.cat((self._priorities, priorities), dim=0)
+        if cpu_rows.shape[0] > self.cache_tokens:
+            keep = priorities.topk(self.cache_tokens, sorted=False).indices
+            cpu_rows = cpu_rows.index_select(0, keep)
+            priorities = priorities.index_select(0, keep)
+        self._cache = cpu_rows
+        self._priorities = priorities
+
+    def finalize(self) -> torch.Tensor:
+        if self._cache is None:
+            raise RuntimeError("no reference activations were cached")
+        return self._cache.float()
+
+    def free(self) -> None:
+        self._cache = None
+        self._priorities = None
+
+
 def _closed_form_d(
     hessian_perp: torch.Tensor,
     residual: torch.Tensor,
@@ -198,11 +284,36 @@ def _modeled_activation_error(
     residual: torch.Tensor,
     cached_x: torch.Tensor,
     bits: int,
+    group_size: int = 0,
 ) -> torch.Tensor:
+    """Lemma-1 model of the activation channel.
+
+    Under per-token, per-group symmetric uniform activation quantization the noise
+    covariance is constant within a group, so F_A factorizes per group G as
+
+        F_A = sum_G (mean_t max_{i in G} X_ti^2 / d_i^2) * (sum_{i in G} d_i^2 ||P_i,:||^2) / (12 kappa^2),
+
+    with P the residual in unsmoothed coordinates.  ``group_size >= c`` (or 0)
+    recovers the global per-token form (Eq. FAdyn).  Unlike the global case, D no
+    longer cancels: it trades the within-group peak against the within-group
+    energy, which is exactly the leverage optimize_d exploits.
+    """
     qmax = float(2 ** (bits - 1) - 1)
-    token_step2 = (cached_x.square() / d.square()).amax(dim=1).mean() / (qmax * qmax)
-    residual_energy = (d.square() * residual.square().sum(dim=1)).sum()
-    return token_step2 * residual_energy / 12.0
+    columns = residual.shape[0]
+    group_size = columns if group_size <= 0 else group_size
+    xs = cached_x.square() / d.square()
+    p_energy = d.square() * residual.square().sum(dim=1)
+    if group_size >= columns:
+        return xs.amax(dim=1).mean() * p_energy.sum() / (12.0 * qmax * qmax)
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    if pad:
+        xs = F.pad(xs, (0, pad))
+        p_energy = F.pad(p_energy, (0, pad))
+    tokens = xs.shape[0]
+    group_peak = xs.reshape(tokens, num_groups, group_size).amax(dim=-1).mean(dim=0)
+    group_energy = p_energy.reshape(num_groups, group_size).sum(dim=-1)
+    return (group_peak * group_energy).sum() / (12.0 * qmax * qmax)
 
 
 def optimize_d(
@@ -216,6 +327,8 @@ def optimize_d(
     initial = _closed_form_d(hessian_perp, residual, config.p, config.d_clip)
     if config.d_mode == "closed_form" or cached_x is None or config.d_steps <= 0:
         return initial
+
+    fa_group = config.activation_group_size if config.d_fa_group_size < 0 else config.d_fa_group_size
 
     device = residual.device
     x = cached_x.to(device=device, dtype=torch.float32)
@@ -233,7 +346,7 @@ def optimize_d(
             d = centered.exp()
             fw = _modeled_weight_error(d, residual, hdiag, config.bits, config.group_size)
             if config.activation_bits < 16 and config.activation_weight > 0:
-                fa = _modeled_activation_error(d, residual, x, config.activation_bits)
+                fa = _modeled_activation_error(d, residual, x, config.activation_bits, fa_group)
             else:
                 fa = fw.new_zeros(())
             loss = (fw + config.activation_weight * fa + 1e-20).log()
@@ -273,22 +386,25 @@ def weighted_low_rank(
     hessian: torch.Tensor,
     weight: torch.Tensor,
     config: QuantConfig,
+    rank: int | None = None,
+    beta: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Solve min_rank(L)<=r ||H^beta (W-L)||_F and fix the H-orthogonal gauge."""
 
-    rank = min(config.rank, weight.shape[0], weight.shape[1])
+    rank = min(config.rank if rank is None else rank, weight.shape[0], weight.shape[1])
+    beta = config.beta if beta is None else beta
     if rank == 0:
         return weight.new_zeros((weight.shape[0], 0)), weight.new_zeros((0, weight.shape[1]))
 
     hreg = _regularize_hessian(hessian, config.damp)
-    if config.beta == 0:
+    if beta == 0:
         transformed = weight
         eigvals = eigvecs = None
     else:
         eigvals, eigvecs = torch.linalg.eigh(hreg)
         eigvals = eigvals.clamp_min(1e-10)
         projected = eigvecs.T @ weight
-        transformed = eigvecs @ (eigvals.pow(config.beta)[:, None] * projected)
+        transformed = eigvecs @ (eigvals.pow(beta)[:, None] * projected)
 
     u, s, v = _truncated_svd(
         transformed,
@@ -297,10 +413,10 @@ def weighted_low_rank(
         config.svd_oversample,
         config.svd_niter,
     )
-    if config.beta == 0:
+    if beta == 0:
         l1 = u
     else:
-        l1 = eigvecs @ (eigvals.pow(-config.beta)[:, None] * (eigvecs.T @ u))
+        l1 = eigvecs @ (eigvals.pow(-beta)[:, None] * (eigvecs.T @ u))
     l2 = s[:, None] * v.T
 
     # Gauge: L1^T H L1 = I, while preserving L1 L2.
@@ -314,16 +430,19 @@ def weighted_low_rank(
 
 @torch.no_grad()
 def gptq_quantize_residual(
-    residual: torch.Tensor,
+    target: torch.Tensor,
     hessian: torch.Tensor,
     config: QuantConfig,
+    prepared_upper: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """GPTQ-quantize R and return dequantized R, integer Z, and group scales.
+    """GPTQ-quantize a target and return dequantized weights, codes, and scales.
 
-    ``residual`` uses [in, out] layout; codes use PyTorch [out, in] layout.
+    ``target`` uses [in, out] layout; codes use PyTorch [out, in] layout.
+    For the legacy F_W objective the target is the low-rank residual.  For the
+    joint objective it is the activation-aware pseudo-target.
     """
 
-    weight = residual.T.contiguous().float()
+    weight = target.T.contiguous().float()
     out_features, in_features = weight.shape
     qmax = 2 ** (config.bits - 1) - 1
     group_size = in_features if config.group_size <= 0 else config.group_size
@@ -335,19 +454,10 @@ def gptq_quantize_residual(
         end = min(start + group_size, in_features)
         scales[:, group] = weight[:, start:end].abs().amax(dim=1).clamp_min(1e-8) / float(qmax)
 
-    hreg = _regularize_hessian(hessian, config.damp)
-    chol = None
-    for attempt in range(5):
-        try:
-            chol = torch.linalg.cholesky(hreg)
-            break
-        except RuntimeError:
-            extra = hreg.diagonal().mean().clamp_min(1e-8) * (10.0 ** attempt) * config.damp
-            hreg = hreg + torch.eye(in_features, device=hreg.device) * extra
-    if chol is None:
-        raise RuntimeError("failed to stabilize deflated Hessian for GPTQ")
-    hinv = torch.cholesky_inverse(chol)
-    upper = torch.linalg.cholesky(hinv, upper=True)
+    if prepared_upper is None:
+        _, upper = _prepare_gptq_metric(hessian, config)
+    else:
+        upper = prepared_upper
 
     work = weight.clone()
     codes = torch.empty_like(weight, dtype=torch.int8)
@@ -375,6 +485,103 @@ def gptq_quantize_residual(
     return dequant.T.contiguous(), codes, scales
 
 
+def _prepare_gptq_metric(
+    hessian: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Regularize and factor a GPTQ metric once for target solving and feedback."""
+
+    hreg = _regularize_hessian(hessian, config.damp)
+    chol = None
+    for attempt in range(5):
+        try:
+            chol = torch.linalg.cholesky(hreg)
+            break
+        except RuntimeError:
+            extra = hreg.diagonal().mean().clamp_min(1e-8) * (10.0**attempt) * config.damp
+            hreg = hreg + torch.eye(hreg.shape[0], device=hreg.device, dtype=hreg.dtype) * extra
+    if chol is None:
+        raise RuntimeError("failed to stabilize quantization metric for GPTQ")
+    hinv = torch.cholesky_inverse(chol)
+    return chol, torch.linalg.cholesky(hinv, upper=True)
+
+
+def _prepare_joint_metric(
+    metric: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Factor H_perp + Sigma_A without injecting the legacy GPTQ damping.
+
+    Positive activation-noise variance removes H_perp's rank-r null space.  A
+    tiny diagonal jitter is used only if finite-precision Cholesky needs it.
+    """
+
+    metric = _sym(metric.float())
+    reference = metric.diagonal().mean().clamp_min(1e-12)
+    identity = torch.eye(metric.shape[0], device=metric.device, dtype=metric.dtype)
+    chol = None
+    jitter_value = 0.0
+    for attempt in range(6):
+        jitter_value = 0.0 if attempt == 0 else float(reference.item()) * (10.0 ** (attempt - 9))
+        candidate = metric if jitter_value == 0.0 else metric + identity * jitter_value
+        try:
+            chol = torch.linalg.cholesky(candidate)
+            break
+        except RuntimeError:
+            continue
+    if chol is None:
+        raise RuntimeError("failed to factor H_perp + Sigma_A for joint GPTQ")
+    hinv = torch.cholesky_inverse(chol)
+    return chol, torch.linalg.cholesky(hinv, upper=True), jitter_value
+
+
+def joint_code_target(
+    hessian_perp: torch.Tensor,
+    weight: torch.Tensor,
+    sigma_a: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Build the exact two-channel pseudo-target for fixed D and L1.
+
+    After eliminating L2, the modeled objective is
+
+        ||W - Q||^2_{H_perp} + lambda * ||Q||^2_{Sigma_A}.
+
+    Completing the square gives metric M = H_perp + lambda Sigma_A and target
+    T = M^{-1} H_perp W.  The same stabilized factor is reused by GPTQ.
+    """
+
+    sigma = sigma_a * float(config.activation_weight)
+    metric = _sym(hessian_perp + torch.diag(sigma))
+    chol, upper, jitter = _prepare_joint_metric(metric)
+    target = torch.cholesky_solve(hessian_perp @ weight, chol)
+    return target, metric, upper, jitter
+
+
+def joint_surrogate_terms(
+    hessian: torch.Tensor,
+    weight: torch.Tensor,
+    l1: torch.Tensor,
+    l2: torch.Tensor,
+    quantized_residual: torch.Tensor,
+    sigma_a: torch.Tensor,
+    activation_weight: float,
+) -> dict[str, float]:
+    """Evaluate the common F_W + lambda F_A model after the post-Q refit."""
+
+    delta = weight - l1 @ l2 - quantized_residual
+    fw = ((hessian @ delta) * delta).sum()
+    fa = (sigma_a[:, None] * quantized_residual.square()).sum()
+    normalizer = max(1, weight.shape[1])
+    fw_value = float((fw / normalizer).item())
+    fa_value = float((fa / normalizer).item())
+    return {
+        "fw": fw_value,
+        "fa": fa_value,
+        "weighted_fa": float(activation_weight) * fa_value,
+        "joint": fw_value + float(activation_weight) * fa_value,
+    }
+
+
 def refit_l2(
     hessian: torch.Tensor,
     weight: torch.Tensor,
@@ -389,6 +596,73 @@ def refit_l2(
     return torch.linalg.solve(gram, rhs)
 
 
+def activation_noise_diagonal(
+    cached_x: torch.Tensor,
+    d: torch.Tensor,
+    activation_bits: int,
+    group_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Diagonal of Sigma_A in smoothed coordinates, per Lemma 1.
+
+    Under the per-token (optionally per-group) symmetric uniform activation
+    quantizer, sigma_i^2 = mean_t max_{j in G(i)} (X_tj / d_j)^2 / (12 kappa^2),
+    block-constant within each activation group.  The global per-token case
+    (group_size 0) yields an isotropic sigma^2 I, as predicted by the theory.
+    """
+
+    if activation_bits >= 16:
+        return torch.zeros_like(d)
+    qmax = float(2 ** (activation_bits - 1) - 1)
+    columns = d.shape[0]
+    group_size = columns if group_size <= 0 else group_size
+    xs = cached_x.to(device=device, dtype=torch.float32).square() / d.square()
+    if group_size >= columns:
+        peak = xs.amax(dim=1).mean()
+        return torch.full_like(d, float(peak) / (12.0 * qmax * qmax))
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    if pad:
+        xs = F.pad(xs, (0, pad))
+    peaks = xs.reshape(-1, num_groups, group_size).amax(dim=-1).mean(dim=0)
+    sigma = peaks.repeat_interleave(group_size)[:columns]
+    return sigma / (12.0 * qmax * qmax)
+
+
+def activation_aware_branch(
+    wtilde: torch.Tensor,
+    sigma_a: torch.Tensor,
+    rank_a: int,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """L1 block spanning the top left-singular vectors of Sigma_A^{1/2} Wtilde.
+
+    The F_A-optimal rank-r_a branch is the weighted Eckart--Young truncation
+    (Prop. fa-branch of hsvdquant.tex); we only need its column space here
+    because L2 is refit jointly afterwards.  Also returns the top singular
+    values of Sigma_A^{1/2} Wtilde (the marginal F_A gains of Prop. split).
+    """
+
+    scale = sigma_a.clamp_min(1e-30).sqrt()
+    u, s, _ = _truncated_svd(
+        scale[:, None] * wtilde,
+        rank_a,
+        config.svd_mode,
+        config.svd_oversample,
+        config.svd_niter,
+    )
+    return u / scale[:, None], s
+
+
+def _whiten_h_gauge(l1: torch.Tensor, hessian: torch.Tensor) -> torch.Tensor:
+    """Rescale columns of l1 so that l1^T H l1 = I, preserving the span."""
+
+    gram = _sym(l1.T @ hessian @ l1)
+    values, vectors = torch.linalg.eigh(gram)
+    values = values.clamp_min(1e-10)
+    return l1 @ (vectors @ (values.rsqrt()[:, None] * vectors.T))
+
+
 def _dequantize_codes(codes: torch.Tensor, scales: torch.Tensor, group_size: int) -> torch.Tensor:
     in_features = codes.shape[1]
     group_size = in_features if group_size <= 0 else group_size
@@ -396,12 +670,101 @@ def _dequantize_codes(codes: torch.Tensor, scales: torch.Tensor, group_size: int
     return codes.float() * scales.index_select(1, group_index)
 
 
-def _quantize_activation(inputs: torch.Tensor, bits: int) -> torch.Tensor:
+def _quantize_activation(inputs: torch.Tensor, bits: int, group_size: int = 0) -> torch.Tensor:
+    """Per-token symmetric uniform quantization, optionally per channel-group.
+
+    group_size 0 (or >= c) keeps the single per-token max across all channels.
+    """
     if bits >= 16:
         return inputs
     qmax = float(2 ** (bits - 1) - 1)
-    scale = inputs.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
-    return torch.round(inputs / scale).clamp(-qmax, qmax) * scale
+    columns = inputs.shape[-1]
+    if group_size <= 0 or group_size >= columns:
+        scale = inputs.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+        return torch.round(inputs / scale).clamp(-qmax, qmax) * scale
+    lead = inputs.shape[:-1]
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    padded = inputs if not pad else F.pad(inputs, (0, pad))
+    grouped = padded.reshape(*lead, num_groups, group_size)
+    scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+    quantized = torch.round(grouped / scale).clamp(-qmax, qmax) * scale
+    quantized = quantized.reshape(*lead, num_groups * group_size)
+    return quantized[..., :columns] if pad else quantized
+
+
+@torch.no_grad()
+def cumulative_target_weight(
+    layer: nn.Linear,
+    hessian: torch.Tensor,
+    propagated_x: torch.Tensor,
+    reference_x: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Project accumulated upstream error onto the current Linear's weights.
+
+    For reference inputs X and propagated inputs Xhat, the cumulative objective
+
+        min_A ||X W - Xhat A||_F^2
+
+    has A* = W + Hhat^{-1} Xhat^T (X-Xhat) W.  The finite-cache estimator uses
+    the paired-cache Hessian and a trajectory-specific ridge.  A closed-form
+    line search and norm trust region guarantee that the accepted correction
+    does not increase paired teacher MSE merely because the empirical Hessian
+    is ill-conditioned.  The target outputs are kept separately so candidate
+    selection still measures the requested XW target, including the
+    irreducible component outside span(Xhat).
+    """
+
+    device = layer.weight.device
+    xhat = propagated_x.to(device=device, dtype=torch.float32)
+    xref = reference_x.to(device=device, dtype=torch.float32)
+    if xhat.shape != xref.shape:
+        raise ValueError(
+            f"paired cumulative caches must have equal shapes, got {tuple(xhat.shape)} and {tuple(xref.shape)}"
+        )
+    weight = layer.weight.detach().T.float()
+    target_outputs = xref @ weight
+    upstream_delta = target_outputs - xhat @ weight
+    paired_hessian = _sym(xhat.T @ xhat / float(max(1, xhat.shape[0])))
+    cross = xhat.T @ upstream_delta / float(max(1, xhat.shape[0]))
+    direction = torch.linalg.solve(
+        _regularize_hessian(paired_hessian, config.trajectory_damp),
+        cross,
+    )
+    direction_output = xhat @ direction
+    denominator = direction_output.square().sum().clamp_min(1e-30)
+    line_scale = (
+        (upstream_delta * direction_output).sum() / denominator
+    ).clamp(0.0, 1.0)
+    line_scale = line_scale * float(config.trajectory_scale)
+    correction = direction * line_scale
+    raw_norm_ratio = correction.norm().div(weight.norm().clamp_min(1e-20))
+    trust_scale = min(
+        1.0,
+        float(config.trajectory_max_norm_ratio) / float(raw_norm_ratio.clamp_min(1e-30)),
+    )
+    correction = correction * trust_scale
+    target_weight = weight + correction
+    projected_mse = float((xhat @ target_weight - target_outputs).square().mean().item())
+    upstream_mse = float(upstream_delta.square().mean().item())
+    if projected_mse > upstream_mse * (1.0 + 1e-5):
+        # Numerical guard: W (zero correction) is always a feasible candidate.
+        correction.zero_()
+        target_weight = weight
+        projected_mse = upstream_mse
+    diagnostics = {
+        "upstream_mse": upstream_mse,
+        "projected_mse": projected_mse,
+        "correction_norm_ratio": float(
+            correction.norm().div(weight.norm().clamp_min(1e-20)).item()
+        ),
+        "raw_correction_norm_ratio": float(raw_norm_ratio.item()),
+        "correction_line_scale": float(line_scale.item()),
+        "correction_trust_scale": float(trust_scale),
+        "correction_relative_gain": (upstream_mse - projected_mse) / max(upstream_mse, 1e-30),
+    }
+    return target_weight, target_outputs, diagnostics
 
 
 def _state_error(
@@ -413,14 +776,20 @@ def _state_error(
     l2: torch.Tensor,
     quantized_residual: torch.Tensor,
     activation_bits: int,
+    activation_group_size: int = 0,
+    target_outputs: torch.Tensor | None = None,
 ) -> float:
     if cached_x is not None:
         x = cached_x.to(device=original_weight.device, dtype=torch.float32)
         smoothed = x / d
-        prediction = _quantize_activation(smoothed, activation_bits) @ quantized_residual
+        prediction = _quantize_activation(smoothed, activation_bits, activation_group_size) @ quantized_residual
         if l1.shape[1]:
             prediction = prediction + (smoothed @ l1) @ l2
-        target = x @ original_weight
+        target = (
+            x @ original_weight
+            if target_outputs is None
+            else target_outputs.to(device=original_weight.device, dtype=torch.float32)
+        )
         return float((prediction - target).square().mean().item())
     effective = (l1 @ l2 + quantized_residual) / d[:, None]
     error = original_weight - effective
@@ -433,13 +802,28 @@ def joint_quantize_linear(
     hessian: torch.Tensor,
     cached_x: torch.Tensor | None,
     config: QuantConfig,
+    target_weight: torch.Tensor | None = None,
+    target_outputs: torch.Tensor | None = None,
+    objective_diagnostics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Jointly update D, L1, Z, and L2 for one Linear layer."""
+    """Jointly update D, L1, Z, and L2 for one Linear layer.
+
+    ``target_weight`` optionally replaces the local W target with the projected
+    cumulative-error target.  Runtime dimensions, dtype, bias, and checkpoint
+    metadata continue to come from ``layer``.
+    """
 
     config.validate()
     device = layer.weight.device
     original_dtype = layer.weight.dtype
-    weight = layer.weight.detach().T.float()  # [in, out]
+    local_weight = layer.weight.detach().T.float()  # [in, out]
+    weight = (
+        local_weight
+        if target_weight is None
+        else target_weight.to(device=device, dtype=torch.float32)
+    )
+    if weight.shape != local_weight.shape:
+        raise ValueError(f"target_weight has shape {tuple(weight.shape)}, expected {tuple(local_weight.shape)}")
     hessian = hessian.to(device=device, dtype=torch.float32)
     cached_x_device = None if cached_x is None else cached_x
 
@@ -460,41 +844,152 @@ def joint_quantize_linear(
 
         htilde = hessian / d[:, None] / d[None, :]
         wtilde = d[:, None] * weight
-        l1, l2_initial = weighted_low_rank(htilde, wtilde, config)
-        hperp_tilde = _hessian_deflate(htilde, l1)
-        residual = wtilde - l1 @ l2_initial
-        quantized_residual, codes, scales = gptq_quantize_residual(residual, hperp_tilde, config)
-        l2 = refit_l2(htilde, wtilde, quantized_residual, l1)
-        error = _state_error(
-            weight,
-            hessian,
-            cached_x_device,
-            d,
-            l1,
-            l2,
-            quantized_residual,
-            config.activation_bits,
-        )
-        history.append(error)
-        candidate = {
-            "d": d.detach().to("cpu", dtype=torch.float32),
-            "l1": l1.detach().to("cpu", dtype=original_dtype),
-            "l2": l2.detach().to("cpu", dtype=original_dtype),
-            "codes": codes.detach().to("cpu"),
-            "scales": scales.detach().to("cpu", dtype=original_dtype),
-            "bias": None
-            if layer.bias is None
-            else layer.bias.detach().to("cpu", dtype=original_dtype),
-            "in_features": layer.in_features,
-            "out_features": layer.out_features,
-            "group_size": config.group_size,
-            "bits": config.bits,
-            "activation_bits": config.activation_bits,
-            "error": error,
-            "outer_iteration": outer,
-        }
-        if best is None or error < best["error"]:
-            best = candidate
+        if cached_x_device is not None and config.activation_bits < 16:
+            sigma_a = activation_noise_diagonal(
+                cached_x_device,
+                d,
+                config.activation_bits,
+                config.activation_group_size,
+                device,
+            )
+        else:
+            sigma_a = torch.zeros_like(d)
+        split: dict[str, Any] = {"rank_w": config.rank, "rank_a": 0}
+        if config.rank_a > 0 and cached_x_device is not None and config.activation_bits < 16:
+            l1_a, s_a = activation_aware_branch(wtilde, sigma_a, config.rank_a, config)
+            g_a1 = float(s_a[0].square()) if s_a.numel() else 0.0
+            eig_tail = torch.linalg.eigvalsh(htilde).clamp_min(0)
+            g_w_next = (
+                float(eig_tail[-(config.rank - config.rank_a + 1)])
+                if eig_tail.numel() >= config.rank - config.rank_a + 1
+                else 0.0
+            )
+            split.update({"g_a1": g_a1, "g_w_next": g_w_next})
+            # Gate (Prop. split): spend a rank unit on the F_A block only when its
+            # marginal gain beats the next F_W deflation direction; gated-out
+            # modules keep the full budget on the W block.
+            use_split = config.rank_a_mode == "fixed" or g_a1 > g_w_next
+            split["gated_in"] = bool(use_split) if config.rank_a_mode == "gated" else None
+            if use_split:
+                l1_w, _ = weighted_low_rank(htilde, wtilde, config, rank=config.rank - config.rank_a)
+                l1 = _whiten_h_gauge(torch.cat([l1_w, l1_a], dim=1), htilde)
+                # Pre-GPTQ L2: joint refit in the combined metric Htilde + Sigma_A,
+                # i.e. the branch is fitted against F_W and F_A simultaneously
+                # before the residual is frozen for quantization.
+                l2_initial = refit_l2(htilde + torch.diag(sigma_a), wtilde, torch.zeros_like(wtilde), l1)
+                split.update({"rank_w": config.rank - config.rank_a, "rank_a": config.rank_a})
+            else:
+                l1, l2_initial = weighted_low_rank(htilde, wtilde, config)
+        else:
+            if config.rank_a > 0 and (cached_x_device is None or config.activation_bits >= 16):
+                pass  # no activation channel to serve; full budget stays on W
+            l1, l2_initial = weighted_low_rank(htilde, wtilde, config)
+
+        inner_iters = config.joint_code_iters if config.code_objective == "joint" else 1
+        inner_history: list[dict[str, Any]] = []
+        for joint_iteration in range(inner_iters):
+            hperp_tilde = _hessian_deflate(htilde, l1)
+            if config.code_objective == "joint" and config.activation_bits < 16:
+                target, code_metric, prepared_upper, metric_jitter = joint_code_target(
+                    hperp_tilde,
+                    wtilde,
+                    sigma_a,
+                    config,
+                )
+                quantized_residual, codes, scales = gptq_quantize_residual(
+                    target,
+                    code_metric,
+                    config,
+                    prepared_upper=prepared_upper,
+                )
+                target_norm_ratio = float(
+                    target.norm().div(wtilde.norm().clamp_min(1e-20)).item()
+                )
+            else:
+                residual = wtilde - l1 @ l2_initial
+                quantized_residual, codes, scales = gptq_quantize_residual(
+                    residual,
+                    hperp_tilde,
+                    config,
+                )
+                target_norm_ratio = 1.0
+                metric_jitter = 0.0
+
+            # Once the complete quantized tensor is frozen, the total objective's
+            # exact L2 block is the original H-metric least-squares refit.
+            l2 = refit_l2(htilde, wtilde, quantized_residual, l1)
+            terms = joint_surrogate_terms(
+                htilde,
+                wtilde,
+                l1,
+                l2,
+                quantized_residual,
+                sigma_a,
+                config.activation_weight,
+            )
+            error = _state_error(
+                weight,
+                hessian,
+                cached_x_device,
+                d,
+                l1,
+                l2,
+                quantized_residual,
+                config.activation_bits,
+                config.activation_group_size,
+                target_outputs,
+            )
+            history.append(error)
+            inner_history.append(
+                {
+                    "iteration": joint_iteration,
+                    "state_mse": error,
+                    "target_norm_ratio": target_norm_ratio,
+                    "metric_jitter": metric_jitter,
+                    **terms,
+                }
+            )
+            candidate = {
+                "d": d.detach().to("cpu", dtype=torch.float32),
+                "l1": l1.detach().to("cpu", dtype=original_dtype),
+                "l2": l2.detach().to("cpu", dtype=original_dtype),
+                "codes": codes.detach().to("cpu"),
+                "scales": scales.detach().to("cpu", dtype=original_dtype),
+                "bias": None
+                if layer.bias is None
+                else layer.bias.detach().to("cpu", dtype=original_dtype),
+                "in_features": layer.in_features,
+                "out_features": layer.out_features,
+                "group_size": config.group_size,
+                "bits": config.bits,
+                "activation_bits": config.activation_bits,
+                "activation_group_size": config.activation_group_size,
+                "code_objective": config.code_objective,
+                "joint_code_iteration": joint_iteration,
+                "joint_diagnostics": list(inner_history),
+                "sigma_a_mean": float(sigma_a.mean().item()),
+                "sigma_a_max": float(sigma_a.max().item()),
+                "error": error,
+                "outer_iteration": outer,
+                "rank_split": dict(split),
+                "linear_objective": config.linear_objective,
+                "ablation_mode": config.ablation_mode,
+                "objective_diagnostics": dict(objective_diagnostics or {}),
+            }
+            if best is None or error < best["error"]:
+                best = candidate
+
+            if joint_iteration + 1 < inner_iters:
+                # Exact fixed-Q branch block: fit the rank-r branch to what the
+                # activation-aware quantized path did not carry.  beta=1/2 is
+                # weighted Eckart-Young in the H metric.
+                l1, l2_initial = weighted_low_rank(
+                    htilde,
+                    wtilde - quantized_residual,
+                    config,
+                    rank=config.rank,
+                    beta=0.5,
+                )
 
         previous_a = l1 / d[:, None]
         previous_l2 = l2
@@ -514,6 +1009,7 @@ class HSVQuantLinear(nn.Module):
         self.group_size = int(state["group_size"])
         self.bits = int(state["bits"])
         self.activation_bits = int(state["activation_bits"])
+        self.activation_group_size = int(state.get("activation_group_size", 0))
         dtype = compute_dtype or state["l1"].dtype
         self.register_buffer("d", state["d"].to(dtype=dtype))
         self.register_buffer("l1", state["l1"].to(dtype=dtype))
@@ -533,7 +1029,7 @@ class HSVQuantLinear(nn.Module):
             self._qweight = self._build_qweight(inputs.dtype).to(inputs.device)
         d = self.d.to(dtype=inputs.dtype)
         smoothed = inputs / d
-        quantized_inputs = _quantize_activation(smoothed, self.activation_bits)
+        quantized_inputs = _quantize_activation(smoothed, self.activation_bits, self.activation_group_size)
         output = F.linear(quantized_inputs, self._qweight, None)
         if self.l1.shape[1]:
             output = output + (smoothed @ self.l1.to(inputs.dtype)) @ self.l2.to(inputs.dtype)
@@ -636,6 +1132,43 @@ def capture_first_layer_inputs(
     return hidden_batches, layer_kwargs
 
 
+def _decoder_hidden(output: Any) -> torch.Tensor:
+    """Handle Transformers decoder layers that return either a tensor or tuple."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+        return output[0]
+    raise TypeError(f"unexpected decoder layer output type: {type(output)!r}")
+
+
+def _paired_batch_stats(
+    student: list[torch.Tensor], teacher: list[torch.Tensor]
+) -> dict[str, float]:
+    """Streaming teacher/student trajectory metrics without concatenating caches."""
+    squared_error = 0.0
+    teacher_energy = 0.0
+    student_energy = 0.0
+    inner_product = 0.0
+    elements = 0
+    for student_batch, teacher_batch in zip(student, teacher, strict=True):
+        lhs = student_batch.float()
+        rhs = teacher_batch.float()
+        delta = lhs - rhs
+        squared_error += float(delta.square().sum().item())
+        teacher_energy += float(rhs.square().sum().item())
+        student_energy += float(lhs.square().sum().item())
+        inner_product += float((lhs * rhs).sum().item())
+        elements += delta.numel()
+    mse = squared_error / float(max(1, elements))
+    teacher_mse = teacher_energy / float(max(1, elements))
+    return {
+        "mse": mse,
+        "teacher_energy": teacher_mse,
+        "nmse": mse / max(teacher_mse, 1e-30),
+        "cosine": inner_product / max(math.sqrt(student_energy * teacher_energy), 1e-30),
+    }
+
+
 @torch.no_grad()
 def quantize_qwen_model(
     model: nn.Module,
@@ -651,11 +1184,92 @@ def quantize_qwen_model(
     layers = model.model.layers
     states: dict[str, dict[str, Any]] = {}
     layer_count = len(layers) if max_layers < 0 else min(max_layers, len(layers))
+    propagated_hidden_batches = hidden_batches
+    reference_hidden_batches = hidden_batches
+    diagnostic_reference_hidden_batches = hidden_batches
+    need_reference_path = (
+        config.linear_objective == "cumulative"
+        or config.block_input_mode == "reference"
+        or config.trajectory_diagnostics
+    )
 
     for layer_index in range(layer_count):
         layer = layers[layer_index]
         print(f"[H-SVDQuant] layer {layer_index + 1}/{layer_count}", flush=True)
-        for group in _qwen_sequential_groups(layer):
+        sequential_groups = _qwen_sequential_groups(layer)
+        trajectory_active = (
+            config.linear_objective == "cumulative"
+            and layer_index >= config.trajectory_start_layer
+        )
+        if (
+            config.trajectory_rebase
+            and config.linear_objective == "cumulative"
+            and layer_index == config.trajectory_start_layer
+        ):
+            # Start a new FP target trajectory from the current student state.
+            # The independent diagnostic teacher below remains the original FP path.
+            reference_hidden_batches = propagated_hidden_batches
+        reference_collectors: dict[str, ActivationCache] = {}
+        next_reference_hidden: list[torch.Tensor] | None = None
+        next_diagnostic_reference_hidden: list[torch.Tensor] | None = None
+
+        if config.trajectory_diagnostics:
+            next_diagnostic_reference_hidden = []
+            for hidden, kwargs in zip(
+                diagnostic_reference_hidden_batches, layer_kwargs, strict=True
+            ):
+                output = _decoder_hidden(layer(hidden.to(device), **_move_tree(kwargs, device)))
+                next_diagnostic_reference_hidden.append(output.detach().to("cpu"))
+
+        # Preserve the full-precision path before replacing any module in this
+        # block.  In cumulative mode these paired caches provide X while the
+        # group-wise walk below provides Xhat with identical reservoir indices.
+        if need_reference_path:
+            handles = []
+            if trajectory_active:
+                for group in sequential_groups:
+                    for offset, name in enumerate(group):
+                        module = _get_submodule(layer, name)
+                        cache = ActivationCache(
+                            module.in_features,
+                            cache_tokens,
+                            seed + layer_index * 100 + offset,
+                        )
+                        reference_collectors[name] = cache
+
+                        def reference_hook(
+                            _module: nn.Module,
+                            args: tuple[Any, ...],
+                            _output: Any,
+                            target=cache,
+                        ) -> None:
+                            target.add_batch(args[0])
+
+                        handles.append(module.register_forward_hook(reference_hook))
+
+            next_reference_hidden = []
+            for hidden, kwargs in zip(reference_hidden_batches, layer_kwargs, strict=True):
+                output = _decoder_hidden(layer(hidden.to(device), **_move_tree(kwargs, device)))
+                next_reference_hidden.append(output.detach().to("cpu"))
+            for handle in handles:
+                handle.remove()
+
+        block_hidden_batches = (
+            propagated_hidden_batches
+            if config.block_input_mode == "quantized"
+            else reference_hidden_batches
+        )
+        block_input_stats = (
+            _paired_batch_stats(
+                propagated_hidden_batches,
+                diagnostic_reference_hidden_batches
+                if config.trajectory_diagnostics
+                else reference_hidden_batches,
+            )
+            if need_reference_path
+            else None
+        )
+        for group in sequential_groups:
             collectors: dict[str, ActivationStats] = {}
             handles = []
             for offset, name in enumerate(group):
@@ -674,7 +1288,7 @@ def quantize_qwen_model(
 
                 handles.append(module.register_forward_hook(hook))
 
-            for hidden, kwargs in zip(hidden_batches, layer_kwargs, strict=True):
+            for hidden, kwargs in zip(block_hidden_batches, layer_kwargs, strict=True):
                 layer(hidden.to(device), **_move_tree(kwargs, device))
             for handle in handles:
                 handle.remove()
@@ -683,23 +1297,97 @@ def quantize_qwen_model(
                 module = _get_submodule(layer, name)
                 hessian, cached_x = collectors[name].finalize()
                 started = time.time()
-                state = joint_quantize_linear(module, hessian, cached_x, config)
+                target_weight = None
+                target_outputs = None
+                objective_diagnostics = None
+                if trajectory_active:
+                    if cached_x is None:
+                        raise ValueError("cumulative linear objective requires --activation-cache-tokens > 0")
+                    reference_x = reference_collectors[name].finalize()
+                    target_weight, target_outputs, objective_diagnostics = cumulative_target_weight(
+                        module,
+                        hessian,
+                        cached_x,
+                        reference_x,
+                        config,
+                    )
+                state = joint_quantize_linear(
+                    module,
+                    hessian,
+                    cached_x,
+                    config,
+                    target_weight=target_weight,
+                    target_outputs=target_outputs,
+                    objective_diagnostics=objective_diagnostics,
+                )
                 full_name = f"model.layers.{layer_index}.{name}"
                 states[full_name] = state
                 replacement = HSVQuantLinear(state, compute_dtype=module.weight.dtype).to(device)
                 _set_submodule(layer, name, replacement)
                 collectors[name].free()
+                if name in reference_collectors:
+                    reference_collectors[name].free()
                 print(
                     f"  {name}: best_mse={state['error']:.6e}, "
                     f"iter={state['outer_iteration']}, time={time.time() - started:.1f}s",
                     flush=True,
                 )
 
-        next_hidden: list[torch.Tensor] = []
-        for hidden, kwargs in zip(hidden_batches, layer_kwargs, strict=True):
-            output = layer(hidden.to(device), **_move_tree(kwargs, device))[0]
-            next_hidden.append(output.detach().to("cpu"))
-        hidden_batches = next_hidden
+        if config.block_input_mode == "quantized":
+            next_hidden: list[torch.Tensor] = []
+            for hidden, kwargs in zip(propagated_hidden_batches, layer_kwargs, strict=True):
+                output = _decoder_hidden(layer(hidden.to(device), **_move_tree(kwargs, device)))
+                next_hidden.append(output.detach().to("cpu"))
+            propagated_hidden_batches = next_hidden
+        else:
+            assert next_reference_hidden is not None
+            propagated_hidden_batches = next_reference_hidden
+        if next_reference_hidden is not None:
+            reference_hidden_batches = next_reference_hidden
+        if next_diagnostic_reference_hidden is not None:
+            diagnostic_reference_hidden_batches = next_diagnostic_reference_hidden
+        if need_reference_path:
+            assert next_reference_hidden is not None
+            diagnostic_teacher = (
+                next_diagnostic_reference_hidden
+                if next_diagnostic_reference_hidden is not None
+                else next_reference_hidden
+            )
+            block_output_stats = _paired_batch_stats(propagated_hidden_batches, diagnostic_teacher)
+            target_output_stats = _paired_batch_stats(
+                propagated_hidden_batches, next_reference_hidden
+            )
+            input_mse = float(block_input_stats["mse"] if block_input_stats else 0.0)
+            input_nmse = float(block_input_stats["nmse"] if block_input_stats else 0.0)
+            output_mse = float(block_output_stats["mse"])
+            output_nmse = float(block_output_stats["nmse"])
+            block_diagnostics = {
+                "input_mse": input_mse,
+                "output_mse": output_mse,
+                "input_nmse": input_nmse,
+                "output_nmse": output_nmse,
+                "input_cosine": float(block_input_stats["cosine"] if block_input_stats else 1.0),
+                "output_cosine": float(block_output_stats["cosine"]),
+                "target_output_nmse": float(target_output_stats["nmse"]),
+                "target_output_cosine": float(target_output_stats["cosine"]),
+                "trajectory_active": float(trajectory_active),
+                "trajectory_rebased": float(
+                    config.trajectory_rebase
+                    and layer_index >= config.trajectory_start_layer
+                ),
+                "error_delta": float(output_mse - input_mse),
+                "nmse_delta": float(output_nmse - input_nmse),
+                "correction_gain": (
+                    1.0 - output_nmse / input_nmse
+                    if input_nmse > 1e-30
+                    else 0.0
+                ),
+            }
+            for group in sequential_groups:
+                for name in group:
+                    states[f"model.layers.{layer_index}.{name}"][
+                        "block_trajectory_diagnostics"
+                    ] = block_diagnostics
         torch.cuda.empty_cache() if device.type == "cuda" else None
     return states
 
@@ -731,11 +1419,15 @@ def _make_calibration_batches(
             start = rng.randint(0, encoded.numel() - sequence_length - 1)
             samples.append(encoded[start : start + sequence_length])
     elif dataset_name == "c4":
-        dataset = load_dataset("allenai/c4", "en", split="train", streaming=True).shuffle(
-            seed=seed, buffer_size=10_000
-        )
-        for row in dataset:
-            ids = tokenizer(row["text"], return_tensors="pt", truncation=False).input_ids[0]
+        local_c4 = os.environ.get("HSVDQ_C4_TRAIN", "")
+        endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+        url = f"{endpoint}/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
+        source = open(local_c4, "rb") if local_c4 else urllib.request.urlopen(url, timeout=120)
+        with source as response:
+            rows = list(gzip.GzipFile(fileobj=response))
+        rng.shuffle(rows)
+        for line in rows:
+            ids = tokenizer(json.loads(line)["text"], return_tensors="pt", truncation=False).input_ids[0]
             if ids.numel() < sequence_length:
                 continue
             start = rng.randint(0, ids.numel() - sequence_length)
@@ -856,15 +1548,76 @@ def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> nn
     return model
 
 
+def _resolve_ablation_mode(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve named ablations into mutually isolated solver settings.
+
+    V1 is the original same-cache local reconstruction.  V2 adds only the
+    explicit F_W + lambda F_A joint code/D objective.  V3 adds only the paired
+    FP-teacher target and propagated student trajectory.  V2+V3 composes both.
+    The activation quantizer itself remains enabled according to
+    ``activation_bits`` in every mode, so A4 inference is identical.
+    """
+
+    resolved: dict[str, Any] = {
+        "rank_a": args.rank_a,
+        "code_objective": args.code_objective,
+        "joint_code_iters": args.joint_code_iters,
+        "block_input_mode": args.block_input_mode,
+        "linear_objective": args.linear_objective,
+        "activation_weight": args.activation_weight,
+    }
+    mode = args.ablation_mode
+    if mode == "custom":
+        return resolved
+    resolved.update(rank_a=0, block_input_mode="quantized")
+    if mode == "v1":
+        resolved.update(
+            code_objective="fw",
+            joint_code_iters=1,
+            linear_objective="local",
+            activation_weight=0.0,
+        )
+    elif mode == "v2":
+        resolved.update(code_objective="joint", linear_objective="local")
+    elif mode == "v3":
+        resolved.update(
+            code_objective="fw",
+            joint_code_iters=1,
+            linear_objective="cumulative",
+            activation_weight=0.0,
+        )
+    elif mode == "v2v3":
+        resolved.update(code_objective="joint", linear_objective="cumulative")
+    if mode in {"v2", "v2v3"} and resolved["activation_weight"] <= 0:
+        raise ValueError(f"ablation mode {mode} requires --activation-weight > 0")
+    return resolved
+
+
 def quantize_command(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = _dtype_from_name(args.dtype)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    ablation = _resolve_ablation_mode(args)
     config = QuantConfig(
         bits=args.bits,
         activation_bits=args.activation_bits,
+        activation_group_size=args.activation_group_size,
+        d_fa_group_size=args.d_fa_group_size,
         rank=args.rank,
+        rank_a=ablation["rank_a"],
+        rank_a_mode=args.rank_a_mode,
+        code_objective=ablation["code_objective"],
+        joint_code_iters=ablation["joint_code_iters"],
+        block_input_mode=ablation["block_input_mode"],
+        linear_objective=ablation["linear_objective"],
+        ablation_mode=args.ablation_mode,
+        trajectory_damp=args.trajectory_damp,
+        trajectory_max_norm_ratio=args.trajectory_max_norm_ratio,
+        trajectory_scale=args.trajectory_scale,
+        trajectory_diagnostics=args.trajectory_diagnostics,
+        trajectory_start_layer=args.trajectory_start_layer,
+        trajectory_rebase=args.trajectory_rebase,
         beta=args.beta,
         p=args.p,
         group_size=args.group_size,
@@ -874,13 +1627,22 @@ def quantize_command(args: argparse.Namespace) -> None:
         d_steps=args.d_steps,
         d_lr=args.d_lr,
         d_clip=args.d_clip,
-        activation_weight=args.activation_weight,
+        activation_weight=ablation["activation_weight"],
         damp=args.damp,
         svd_mode=args.svd_mode,
         svd_oversample=args.svd_oversample,
         svd_niter=args.svd_niter,
     )
     config.validate()
+    print(
+        "[H-SVDQuant] resolved ablation "
+        f"mode={config.ablation_mode}, code={config.code_objective}, "
+        f"trajectory={config.linear_objective}, lambda={config.activation_weight:g}, "
+        f"W{config.bits}A{config.activation_bits}, "
+        f"trajectory_damp={config.trajectory_damp:g}, "
+        f"trajectory_clip={config.trajectory_max_norm_ratio:g}",
+        flush=True,
+    )
 
     tokenizer, batches = _make_calibration_batches(
         args.model,
@@ -944,7 +1706,10 @@ def self_test_command(_args: argparse.Namespace) -> None:
     config = QuantConfig(
         bits=4,
         activation_bits=8,
+        activation_group_size=4,
         rank=3,
+        code_objective="joint",
+        joint_code_iters=2,
         beta=0.5,
         p=2,
         group_size=8,
@@ -960,7 +1725,30 @@ def self_test_command(_args: argparse.Namespace) -> None:
     assert output.shape == (96, out_features)
     assert torch.isfinite(output).all()
     assert state["codes"].dtype == torch.int8
-    assert len(state["history"]) == 2
+    assert len(state["history"]) == 4
+    assert state["activation_group_size"] == 4
+    assert state["code_objective"] == "joint"
+    assert state["joint_diagnostics"]
+    assert quantized.activation_group_size == 4
+    propagated_x = x + 0.05 * torch.randn_like(x)
+    propagated_hessian = propagated_x.T @ propagated_x / propagated_x.shape[0]
+    target_weight, target_outputs, diagnostics = cumulative_target_weight(
+        layer,
+        propagated_hessian,
+        propagated_x,
+        x,
+        config,
+    )
+    cumulative_state = joint_quantize_linear(
+        layer,
+        propagated_hessian,
+        propagated_x,
+        config,
+        target_weight=target_weight,
+        target_outputs=target_outputs,
+        objective_diagnostics=diagnostics,
+    )
+    assert cumulative_state["objective_diagnostics"]["correction_norm_ratio"] > 0
     print(
         json.dumps(
             {
@@ -1017,7 +1805,12 @@ def integration_test_command(_args: argparse.Namespace) -> None:
     config = QuantConfig(
         bits=4,
         activation_bits=8,
+        activation_group_size=8,
         rank=2,
+        code_objective="joint",
+        joint_code_iters=1,
+        block_input_mode="quantized",
+        linear_objective="cumulative",
         beta=0.5,
         group_size=8,
         block_size=8,
@@ -1046,6 +1839,7 @@ def integration_test_command(_args: argparse.Namespace) -> None:
     )
     result = wrapped.loglikelihood([request])
     assert len(states) == 7
+    assert all(state["linear_objective"] == "cumulative" for state in states.values())
     assert len(result) == 1 and math.isfinite(result[0][0])
     print(json.dumps({"status": "ok", "quantized_modules": len(states), "loglikelihood": result[0][0]}, indent=2))
 
@@ -1070,7 +1864,98 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument("--max-layers", type=int, default=-1)
     quantize.add_argument("--bits", type=int, default=4)
     quantize.add_argument("--activation-bits", type=int, default=4)
+    quantize.add_argument(
+        "--activation-group-size",
+        type=int,
+        default=0,
+        help="per-token activation quantization group size over input channels (0 = global max)",
+    )
+    quantize.add_argument(
+        "--d-fa-group-size",
+        type=int,
+        default=-1,
+        help="group size used in the D-block F_A surrogate (-1 = same as --activation-group-size, 0 = global)",
+    )
     quantize.add_argument("--rank", type=int, default=8)
+    quantize.add_argument(
+        "--rank-a",
+        type=int,
+        default=0,
+        help="rank units allocated to the Sigma_A-aware branch block (0 = pure F_W branch)",
+    )
+    quantize.add_argument(
+        "--rank-a-mode",
+        choices=["fixed", "gated"],
+        default="fixed",
+        help="fixed: rank-a everywhere; gated: per module, only when g_A(1) > g_W(rank-rank_a+1)",
+    )
+    quantize.add_argument(
+        "--code-objective",
+        choices=["fw", "joint"],
+        default="fw",
+        help="fw: legacy H_perp GPTQ; joint: GPTQ on H_perp+Sigma_A with the shrunken pseudo-target",
+    )
+    quantize.add_argument(
+        "--joint-code-iters",
+        type=int,
+        default=1,
+        help="alternating joint code / exact fixed-code rank-r branch updates (joint mode only)",
+    )
+    quantize.add_argument(
+        "--block-input-mode",
+        choices=["quantized", "reference"],
+        default="quantized",
+        help="quantized: propagate each quantized block output as the next block cache; reference: use FP block inputs",
+    )
+    quantize.add_argument(
+        "--linear-objective",
+        choices=["local", "cumulative"],
+        default="local",
+        help="local: reconstruct Xhat W; cumulative: reconstruct paired FP target X W from propagated Xhat",
+    )
+    quantize.add_argument(
+        "--ablation-mode",
+        choices=["custom", "v1", "v2", "v3", "v2v3"],
+        default="custom",
+        help=(
+            "named isolated preset: v1=local baseline; v2=local F_W+lambda F_A; "
+            "v3=teacher-student correction only; v2v3=joint objective plus trajectory correction"
+        ),
+    )
+    quantize.add_argument(
+        "--trajectory-damp",
+        type=float,
+        default=0.1,
+        help="ridge coefficient for the paired-cache trajectory projection",
+    )
+    quantize.add_argument(
+        "--trajectory-max-norm-ratio",
+        type=float,
+        default=0.25,
+        help="trust-region cap ||A*-W||_F / ||W||_F for cumulative correction",
+    )
+    quantize.add_argument(
+        "--trajectory-scale",
+        type=float,
+        default=1.0,
+        help="additional scale in (0,1] after the paired-cache line search",
+    )
+    quantize.add_argument(
+        "--trajectory-diagnostics",
+        action="store_true",
+        help="record paired FP-teacher/student hidden-state gap after every decoder block",
+    )
+    quantize.add_argument(
+        "--trajectory-start-layer",
+        type=int,
+        default=0,
+        help="zero-based first decoder layer that enables cumulative trajectory correction",
+    )
+    quantize.add_argument(
+        "--trajectory-rebase",
+        action="store_true",
+        help="at the start layer, seed the optimization teacher with the current student hidden state",
+    )
     quantize.add_argument("--beta", type=float, default=0.5)
     quantize.add_argument("--p", type=float, default=2.0)
     quantize.add_argument("--group-size", type=int, default=128)

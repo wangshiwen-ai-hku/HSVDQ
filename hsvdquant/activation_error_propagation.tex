@@ -1,0 +1,386 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\X}{\bm X}
+\newcommand{\Xh}{\widehat{\bm X}}
+\newcommand{\W}{\bm W}
+\newcommand{\Wh}{\widehat{\bm W}}
+\newcommand{\Y}{\bm Y}
+\newcommand{\D}{\bm D}
+\newcommand{\B}{\bm B}
+\newcommand{\Rr}{\bm R}
+\newcommand{\Rh}{\widehat{\bm R}}
+\newcommand{\Hh}{\widehat{\bm H}}
+\newcommand{\Ht}{\widetilde{\bm H}}
+\newcommand{\C}{\bm C}
+\newcommand{\SigA}{\bm\Sigma_A}
+\newcommand{\Qa}{\mathcal Q_A}
+\newcommand{\Qw}{\mathcal Q_W}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\range}{\operatorname{range}}
+
+\title{\bf Activation-Error Propagation for H-SVDQuant:\\
+From Local Reconstruction to Cumulative Block Reconstruction}
+\author{Companion note to \texttt{hsvdquant.tex}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note studies the sequential calibration objective
+\[
+  \min\left\|\X_l\W_l-\widehat{\Y}_l\right\|_F^2,
+  \qquad
+  \widehat{\Y}_l=
+  \Qa(\widetilde{\Xh}_l)\Qw(\Rr_l)+\Xh_l\bm L_{1,l}\bm L_{2,l},
+\]
+where $\X_l$ is the full-precision reference activation and $\Xh_l$ is the
+activation produced by already-quantized upstream operators.  The main result
+is that the deterministic part of this apparently new problem is exactly the
+old H-SVDQuant problem with two substitutions: use the propagated Hessian
+$\Hh_l=\Xh_l^\top\Xh_l$, and replace $\W_l$ by a projected cumulative target
+$\W_l^\star=\Hh_l^\dagger\Xh_l^\top\X_l\W_l$.  A non-removable projection
+error is added to the objective, but it is constant for the current layer.
+Consequently the low-rank refit, Hessian deflation, GPTQ feedback, smoothing
+gauge, and the joint $F_W+F_A$ code update all retain their form.
+\end{abstract}
+
+\section{Reference and propagated paths}
+
+Suppress the block/linear index $l$.  Let
+\[
+  \X,\Xh\in\R^{m\times c},\qquad \W\in\R^{c\times n},
+  \qquad \Y=\X\W.
+\]
+$\X$ is captured from the untouched full-precision path; $\Xh$ is produced by
+the partially quantized path.  Let $\D=\operatorname{diag}(d_1,\ldots,d_c)$ and
+$\widetilde{\Xh}=\Xh\D^{-1}$.  To match the objective in the question, write
+the full-precision branch in unsmoothed coordinates as
+$\B=\bm L_1\bm L_2$ and the quantized residual in smoothed coordinates as
+$\Rh=\Qw(\Rr)$.  Then
+\begin{equation}\label{eq:deploy}
+  \widehat{\Y}
+  =\Qa(\widetilde{\Xh})\Rh+\Xh\B.
+\end{equation}
+The implementation stores the branch in smoothed coordinates,
+$\widetilde{\B}=\D\B=\widetilde{\bm L}_1\bm L_2$, so its runtime expression
+$(\Xh\D^{-1})\widetilde{\bm L}_1\bm L_2$ is identical to $\Xh\B$.
+
+The old local objective uses $\Xh\W$ as its target.  It therefore teaches the
+current layer to preserve its original weights under the new input, but does
+not ask it to compensate for upstream error.  The cumulative objective instead
+keeps the full-precision target $\X\W$:
+\begin{equation}\label{eq:cumulative}
+  \mathcal J_{\mathrm{cum}}
+  =\left\|\X\W-\Qa(\Xh\D^{-1})\Rh-\Xh\B\right\|_F^2.
+\end{equation}
+
+\section{Exact deterministic reduction}
+
+First turn off activation quantization and define the effective unsmoothed
+matrix
+\[
+  \bm A:=\B+\D^{-1}\Rh,
+  \qquad \Hh:=\Xh^\top\Xh,
+  \qquad \C:=\Xh^\top\X,
+  \qquad \bm G:=\X^\top\X.
+\]
+The deterministic cumulative risk is
+\begin{align}
+  \mathcal J_0(\bm A)
+  &=\|\X\W-\Xh\bm A\|_F^2 \nonumber\\
+  &=\tr(\W^\top\bm G\W)-2\tr(\bm A^\top\C\W)
+    +\tr(\bm A^\top\Hh\bm A).                         \label{eq:quadratic}
+\end{align}
+
+\begin{proposition}[Projected cumulative target]\label{prop:project}
+If $\Hh\succ0$, define
+\begin{equation}\label{eq:astar}
+  \boxed{\quad
+  \bm A^\star=\Hh^{-1}\C\W
+  =\W+\Hh^{-1}\Xh^\top(\X-\Xh)\W .
+  \quad}
+\end{equation}
+Then
+\begin{equation}\label{eq:complete}
+  \mathcal J_0(\bm A)
+  =\underbrace{\|\Hh^{1/2}(\bm A-\bm A^\star)\|_F^2}_{\text{optimizable by the current layer}}
+   +\underbrace{\tr\!\left[\W^\top
+     (\bm G-\C^\top\Hh^{-1}\C)\W\right]}_{\mathcal J_{\rm irr}:\ \text{irreducible at this layer}}.
+\end{equation}
+For singular $\Hh$, the same statement holds with the Moore--Penrose inverse
+and $\mathcal J_{\rm irr}=\|(\bm I-\Xh\Xh^\dagger)\X\W\|_F^2$.
+\end{proposition}
+
+\begin{proof}
+The normal equation of \eqref{eq:quadratic} is
+$\Hh\bm A=\C\W$, which gives \eqref{eq:astar}.  Substitute
+$\bm A=\bm A^\star+(\bm A-\bm A^\star)$ in \eqref{eq:quadratic}; the cross
+term vanishes by the normal equation, yielding \eqref{eq:complete}.  The
+singular case is ordinary least squares projected onto $\range(\Xh)$.
+\end{proof}
+
+Equation~\eqref{eq:astar} is the cumulative-error corrector.  If
+$\Xh=\X+\delta\X$ and the perturbation is small, then to first order
+\begin{equation}\label{eq:firstorder}
+  \bm A^\star-\W
+  \simeq-(\X^\top\X)^{-1}\X^\top\delta\X\,\W.
+\end{equation}
+Thus the current weight update is the least-squares inverse image of the
+upstream activation error.  Error orthogonal to $\range(\Xh)$ cannot be repaired
+by any current linear map and belongs to $\mathcal J_{\rm irr}$.
+
+\subsection{Reduction to the original smoothed problem}
+
+Set
+\begin{equation}\label{eq:smoothed-target}
+  \widetilde{\W}^{\star}:=\D\bm A^\star,
+  \qquad \widetilde{\B}:=\D\B,
+  \qquad \Ht:=\D^{-1}\Hh\D^{-1}.
+\end{equation}
+Since $\bm A=\D^{-1}(\widetilde{\B}+\Rh)$,
+\begin{equation}\label{eq:standardform}
+  \mathcal J_0
+  =\mathcal J_{\rm irr}
+  +\left\|\Ht^{1/2}
+    (\widetilde{\W}^{\star}-\widetilde{\B}-\Rh)\right\|_F^2.
+\end{equation}
+This is exactly the original H-SVDQuant deterministic objective, with
+\begin{equation}\label{eq:substitution}
+  \boxed{
+  \widetilde{\bm H}=\D^{-1}\X^\top\X\D^{-1}
+  \ \longrightarrow\ 
+  \Ht=\D^{-1}\Xh^\top\Xh\D^{-1},
+  \qquad
+  \widetilde{\W}=\D\W
+  \ \longrightarrow\ 
+  \widetilde{\W}^{\star}=\D\Hh^\dagger\Xh^\top\X\W .}
+\end{equation}
+The additive constant $\mathcal J_{\rm irr}$ changes reported absolute error
+but cannot change the minimizer for the current layer.
+
+\begin{corollary}[Recovery of the local objective]
+If $\Xh=\X$, then $\bm A^\star=\W$ and $\mathcal J_{\rm irr}=0$.  All formulas
+reduce to the original local H-SVDQuant derivation.
+\end{corollary}
+
+\section{Activation quantization and the two-channel risk}
+
+Let
+\[
+  \bm E_A:=\Qa(\widetilde{\Xh})-\widetilde{\Xh},
+  \qquad \mathbb E[\bm E_A]=0,
+  \qquad \SigA:=\mathbb E[\bm E_A^\top\bm E_A].
+\]
+Using \eqref{eq:deploy}, the exact output error is
+\[
+  \X\W-\widehat{\Y}
+  =\left(\X\W-\Xh\bm A^\star\right)
+   +\widetilde{\Xh}
+    (\widetilde{\W}^{\star}-\widetilde{\B}-\Rh)
+   -\bm E_A\Rh.
+\]
+The first two deterministic terms are orthogonal by the normal equation.
+Under the usual zero-mean/independence model for activation quantization noise,
+the noise cross terms also vanish.  Therefore
+\begin{equation}\label{eq:twochannel}
+  \boxed{
+  \mathbb E\,\mathcal J_{\mathrm{cum}}
+  =\mathcal J_{\rm irr}
+   +\underbrace{\tr\!\left(\bm\Delta^\top\Ht\bm\Delta\right)}_{F_W^{\rm cum}}
+   +\underbrace{\tr\!\left(\Rh^\top\SigA\Rh\right)}_{F_A^{\rm cum}},
+  \qquad
+  \bm\Delta=\widetilde{\W}^{\star}-\widetilde{\B}-\Rh .}
+\end{equation}
+
+The decomposition keeps its old form, but both channels are now conditioned on
+the propagated path: $F_W$ uses $\Ht$ and the shifted target
+$\widetilde{\W}^{\star}$, while $F_A$ uses the noise covariance of
+$\Qa(\Xh\D^{-1})$.  This matters because compensation can increase the norm or
+dynamic range of the residual, reducing deterministic accumulated error while
+increasing activation error.  The existing balance coefficient $\lambda$ is
+therefore more, not less, important:
+\begin{equation}\label{eq:lambda}
+  \mathcal J_\lambda
+  =F_W^{\rm cum}+\lambda F_A^{\rm cum},
+\end{equation}
+with $\mathcal J_{\rm irr}$ omitted during optimization because it is constant.
+
+\section{What changes in each H-SVDQuant block}
+
+\subsection{Low-rank refit and Hessian deflation}
+
+Write $\widetilde{\B}=\bm L_1\bm L_2$.  For fixed $\bm L_1$ and $\Rh$, let
+$\bm M=\bm L_1^\top\Ht\bm L_1$.  The exact post-code update remains
+\begin{equation}\label{eq:l2}
+  \bm L_2^\star
+  =\bm M^{-1}\bm L_1^\top\Ht
+   (\widetilde{\W}^{\star}-\Rh).
+\end{equation}
+Eliminating $\bm L_2$ gives the same deflated metric
+\begin{equation}\label{eq:hperp}
+  \Ht_\perp
+  =\Ht-\Ht\bm L_1
+   (\bm L_1^\top\Ht\bm L_1)^{-1}
+   \bm L_1^\top\Ht.
+\end{equation}
+Hence weighted SVD, the $\Ht$-orthogonal gauge, and rank-$r$ branch updates are
+unchanged algebraically.  They are simply applied to
+$(\Ht,\widetilde{\W}^{\star})$ rather than
+$(\widetilde{\bm H},\widetilde{\W})$.
+
+\subsection{Joint code target}
+
+After eliminating $\bm L_2$, the idealized code block is
+\begin{equation}\label{eq:code}
+  \min_{\Rh\in\mathcal Q_W}
+  \left\|\widetilde{\W}^{\star}-\Rh\right\|_{\Ht_\perp}^2
+  +\lambda\|\Rh\|_{\SigA}^2.
+\end{equation}
+Completing the square gives
+\begin{equation}\label{eq:pseudotarget}
+  \bm M_Q=\Ht_\perp+\lambda\SigA,
+  \qquad
+  \boxed{\ \bm T_Q=\bm M_Q^{-1}\Ht_\perp\widetilde{\W}^{\star}\ },
+\end{equation}
+so GPTQ/GANQ should quantize $\bm T_Q$ under metric $\bm M_Q$.  This is the
+same joint $F_W+F_A$ pseudo-target as before, except that the cumulative target
+$\widetilde{\W}^{\star}$ replaces the original weight.  Positive activation
+noise also regularizes the rank-deficient null space of $\Ht_\perp$.
+
+\subsection{Smoothing}
+
+For fixed $\Xh$ and $\bm A^\star$, changing $\D$ is still a gauge transform:
+\[
+  \widetilde{\Xh}=\Xh\D^{-1},\qquad
+  \widetilde{\W}^{\star}=\D\bm A^\star,\qquad
+  \widetilde{\Xh}\widetilde{\W}^{\star}=\Xh\bm A^\star.
+\]
+Thus $\D$ cannot change the unquantized deterministic optimum or
+$\mathcal J_{\rm irr}$.  It still changes weight group ranges and the covariance
+$\SigA$ through the quantizer, so the existing $F_W+\lambda F_A$ smoothing
+optimization remains valid after replacing the residual relative to $\W$ by
+the residual relative to $\bm A^\star$.
+
+\section{Stable finite-sample estimator}
+
+Computing a pseudoinverse from a small cache is unstable.  Let the propagated
+streaming Hessian and paired-cache cross-error be
+\[
+  \widehat{\bm H}=\frac{1}{N}\sum_{t=1}^N\widehat{\bm x}_t
+    \widehat{\bm x}_t^\top,
+  \qquad
+  \widehat{\bm K}=\frac{1}{M}\sum_{t\in\mathcal C}
+    \widehat{\bm x}_t(\bm x_t-\widehat{\bm x}_t)^\top.
+\]
+The implemented estimator is
+\begin{equation}\label{eq:estimator}
+  \boxed{
+  \widehat{\bm A}^{\star}_\varepsilon
+  =\W+(\widehat{\bm H}+\varepsilon\bm I)^{-1}
+    \widehat{\bm K}\W .}
+\end{equation}
+It retains the full-token curvature used by GPTQ while estimating only the
+upstream mismatch on a bounded, paired reservoir.  The reference and propagated
+reservoirs use identical random priorities, so their rows remain aligned.
+
+The damping has a statistical meaning beyond numerical Cholesky stability: it
+shrinks compensation in activation directions that are weakly observed under
+$\Xh$.  Without it, a small singular value can turn a modest upstream mismatch
+into a very large correction, inflate quantization ranges, and increase $F_A$.
+
+\section{Sequential block and linear calibration}
+
+For decoder block $l$, maintain two paths:
+\begin{enumerate}[leftmargin=2em]
+  \item Run the untouched block on reference input $\X_l$ once.  Cache the
+        reference input of every linear and save the full-precision block output
+        $\X_{l+1}$.
+  \item Run the working block on propagated input $\Xh_l$.  Process true
+        dependency groups in order: attention input projections
+        $(q,k,v)$, attention output projection, MLP input projections
+        (gate, up), and MLP output projection.
+  \item Before each group, collect its propagated Hessians/caches using all
+        already-quantized predecessor groups.  For each linear, construct
+        \eqref{eq:estimator}, run H-SVDQuant, and replace the module immediately.
+  \item Run the fully quantized block on $\Xh_l$ to obtain $\Xh_{l+1}$.
+\end{enumerate}
+Parallel projections are not artificially ordered: $q/k/v$ share the same
+input, as do gate/up, so they are calibrated independently from the same cache.
+Only genuine graph dependencies are propagated.  This is the block analogue of
+GPTQ error feedback, while \eqref{eq:estimator} is its activation-space,
+cross-layer counterpart.
+
+\section{Predictions, risks, and ablations}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Block input & Linear objective & Interpretation \\
+\midrule
+reference & local & no inter-block feedback control \\
+quantized & local & strategy (a): propagated calibration only \\
+reference & cumulative & intra-block accumulated-error compensation \\
+quantized & cumulative & strategies (a)+(b), full sequential compensation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The theory gives several falsifiable predictions.
+\begin{enumerate}[leftmargin=2em]
+  \item The cumulative mode should reduce the measured paired target error
+        $\|\X\W-\widehat\Y\|_F^2$, but need not reduce the local error
+        $\|\Xh\W-\widehat\Y\|_F^2$.
+  \item Gains should grow with depth while correction norms remain controlled;
+        no gain at the first parallel group is expected because $\Xh_1=\X_1$.
+  \item Very large correction-norm ratios diagnose ill-conditioned compensation
+        and predict worse weight/activation quantization.  Increasing damping or
+        clipping the correction is then preferable to increasing rank.
+  \item Because compensation can move mass into the low-precision residual,
+        the best $\lambda$ under the cumulative objective may be larger than the
+        best $\lambda$ under the local objective.
+  \item Report both total paired MSE and its decomposition into upstream MSE,
+        projected (irreducible) MSE, quantized state MSE, and correction-norm
+        ratio.  Perplexity alone cannot distinguish compensation from overfit.
+\end{enumerate}
+
+\section{Summary of theoretical changes}
+
+\begin{center}
+\begin{tabular}{p{0.27\linewidth}p{0.30\linewidth}p{0.33\linewidth}}
+\toprule
+Object & Local reconstruction & Cumulative reconstruction \\
+\midrule
+Target output & $\Xh\W$ & $\X\W$ \\
+Effective weight target & $\W$ & $\bm A^\star=\Hh^\dagger\Xh^\top\X\W$ \\
+Curvature & input Hessian of the local cache & $\Hh=\Xh^\top\Xh$ \\
+Unavoidable term & zero & $\mathcal J_{\rm irr}$ \\
+Smoothed target & $\D\W$ & $\D\bm A^\star$ \\
+Low-rank/$\bm L_2$ updates & original formulas & unchanged, with target substitution \\
+GPTQ metric & Hessian-deflated metric & unchanged, built from $\Hh$ \\
+$F_A$ covariance & noise of $\Qa(\X\D^{-1})$ & noise of $\Qa(\Xh\D^{-1})$ \\
+Joint code target & $\bm M_Q^{-1}\bm H_\perp\D\W$ & $\bm M_Q^{-1}\bm H_\perp\D\bm A^\star$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The central message is concise: cumulative activation-error correction does not
+require a new quantizer or a new low-rank solver.  It requires a paired reference
+path, a propagated path, and the projected target \eqref{eq:astar}.  After that
+substitution, the existing H-SVDQuant machinery applies verbatim, with an added
+irreducible projection error that must be included when reporting absolute
+reconstruction quality.
+
+\end{document}
