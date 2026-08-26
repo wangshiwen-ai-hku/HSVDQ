@@ -25,7 +25,7 @@ import os
 import random
 import time
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -45,6 +45,11 @@ class QuantConfig:
     rank_a_mode: str = "fixed"
     code_objective: str = "fw"
     joint_code_iters: int = 1
+    joint_rotation_mode: str = "none"
+    joint_rotation_fw_epsilon: float = 0.0
+    activation_objective: str = "full"
+    reducible_oracle_tokens: int = 512
+    reducible_oracle_iters: int = 5
     block_input_mode: str = "quantized"
     intra_block_mode: str = "sequential"
     linear_objective: str = "local"
@@ -98,6 +103,21 @@ class QuantConfig:
             raise ValueError("code_objective must be fw or joint")
         if self.joint_code_iters < 1:
             raise ValueError("joint_code_iters must be >= 1")
+        if self.joint_rotation_mode not in {"none", "empirical"}:
+            raise ValueError("joint_rotation_mode must be none or empirical")
+        if self.joint_rotation_mode == "empirical" and self.code_objective != "joint":
+            raise ValueError("empirical joint rotation requires code_objective=joint")
+        if self.joint_rotation_fw_epsilon < 0:
+            raise ValueError("joint_rotation_fw_epsilon must be non-negative")
+        if self.activation_objective not in {"full", "reducible"}:
+            raise ValueError("activation_objective must be full or reducible")
+        if self.activation_objective == "reducible":
+            if self.joint_rotation_mode != "empirical" or self.joint_code_iters < 2:
+                raise ValueError("reducible activation objective requires empirical rotation and joint_code_iters >= 2")
+            if self.reducible_oracle_tokens < 4:
+                raise ValueError("reducible_oracle_tokens must be >= 4")
+            if self.reducible_oracle_iters < 1:
+                raise ValueError("reducible_oracle_iters must be >= 1")
         if self.block_input_mode not in {"quantized", "reference"}:
             raise ValueError("block_input_mode must be quantized or reference")
         if self.intra_block_mode not in {"sequential", "fp_independent"}:
@@ -367,7 +387,11 @@ def optimize_d(
                 centered = centered.clamp(-math.log(config.d_clip), math.log(config.d_clip))
             d = centered.exp()
             fw = _modeled_weight_error(d, residual, hdiag, config.bits, config.group_size)
-            if config.activation_bits < 16 and config.activation_weight > 0:
+            if (
+                config.activation_objective == "full"
+                and config.activation_bits < 16
+                and config.activation_weight > 0
+            ):
                 fa = _modeled_activation_error(d, residual, x, config.activation_bits, fa_group)
             else:
                 fa = fw.new_zeros(())
@@ -618,6 +642,200 @@ def refit_l2(
     return torch.linalg.solve(gram, rhs)
 
 
+def empirical_joint_branch_update(
+    cached_x: torch.Tensor,
+    d: torch.Tensor,
+    weight: torch.Tensor,
+    quantized_residual: torch.Tensor,
+    current_l1: torch.Tensor,
+    current_l2: torch.Tensor,
+    config: QuantConfig,
+    target_outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Optimize the rank-r FP branch for the exact fixed-code W4A4 output.
+
+    For fixed D and dequantized codes Q, solve the empirical block
+
+        min_rank(B)<=r ||Y - Qa(X D^-1) Q - (X D^-1) B||_F^2.
+
+    The ridge regression constructs the unconstrained branch target, and the
+    H^{1/2}-weighted rank-r SVD rotates both L1 and L2.  A fixed-code guard
+    rejects numerical or ridge-induced regressions.  The caller subsequently
+    rebuilds the residual and requantizes it in the next joint-code iteration.
+    """
+
+    x = cached_x.to(device=weight.device, dtype=torch.float32)
+    xtilde = x / d
+    qx = _quantize_activation(
+        xtilde,
+        config.activation_bits,
+        config.activation_group_size,
+    )
+    target = x @ weight if target_outputs is None else target_outputs.to(
+        device=weight.device, dtype=torch.float32
+    )
+    low_path = qx @ quantized_residual
+    branch_target_outputs = target - low_path
+    rows = max(1, xtilde.shape[0])
+    empirical_hessian = _sym(xtilde.T @ xtilde / float(rows))
+    cross = xtilde.T @ branch_target_outputs / float(rows)
+    unconstrained = torch.linalg.solve(
+        _regularize_hessian(empirical_hessian, config.damp),
+        cross,
+    )
+    proposal_l1, proposal_l2 = weighted_low_rank(
+        empirical_hessian,
+        unconstrained,
+        config,
+        rank=config.rank,
+        beta=0.5,
+    )
+    current_error = (
+        target - low_path - (xtilde @ current_l1) @ current_l2
+    ).square().mean()
+    proposal_error = (
+        target - low_path - (xtilde @ proposal_l1) @ proposal_l2
+    ).square().mean()
+    accepted = bool(proposal_error <= current_error * (1.0 + 1e-6))
+    gain = float(((current_error - proposal_error) / current_error.clamp_min(1e-30)).item())
+    diagnostics = {
+        "rotation_fixed_code_mse_before": float(current_error.item()),
+        "rotation_fixed_code_mse_after": float(proposal_error.item()),
+        "rotation_fixed_code_gain": gain,
+        "rotation_fixed_code_accepted": float(accepted),
+    }
+    if not accepted:
+        return current_l1, current_l2, diagnostics
+    return proposal_l1, proposal_l2, diagnostics
+
+
+def _fit_reducible_codebooks(
+    xtilde: torch.Tensor,
+    group_size: int,
+    levels: int,
+    iterations: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Fit analysis-only Lloyd-Max grids after per-token group normalization."""
+
+    columns = xtilde.shape[1]
+    group_size = columns if group_size <= 0 or group_size >= columns else group_size
+    groups = (columns + group_size - 1) // group_size
+    pad = groups * group_size - columns
+    padded = xtilde if pad == 0 else F.pad(xtilde, (0, pad))
+    values = padded.reshape(xtilde.shape[0], groups, group_size)
+    scale = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+    normalized = values / scale
+    quantiles = torch.linspace(0.0, 1.0, levels, device=xtilde.device)
+    books: list[torch.Tensor] = []
+    for group in range(groups):
+        samples = normalized[:, group, :].reshape(-1).float()
+        centers = torch.quantile(samples, quantiles).sort().values
+        for _ in range(iterations):
+            assignment = (samples[:, None] - centers[None, :]).abs().argmin(dim=1)
+            sums = torch.zeros_like(centers).scatter_add_(0, assignment, samples)
+            counts = torch.zeros_like(centers).scatter_add_(
+                0, assignment, torch.ones_like(samples)
+            )
+            proposal = torch.where(counts > 0, sums / counts.clamp_min(1), centers)
+            if torch.max(torch.abs(proposal - centers)) < 1e-6:
+                centers = proposal
+                break
+            centers = proposal
+        books.append(centers.sort().values)
+    return torch.stack(books), group_size, pad
+
+
+def _apply_reducible_codebooks(
+    xtilde: torch.Tensor,
+    books: torch.Tensor,
+    group_size: int,
+    pad: int,
+) -> torch.Tensor:
+    columns = xtilde.shape[1]
+    padded = xtilde if pad == 0 else F.pad(xtilde, (0, pad))
+    values = padded.reshape(xtilde.shape[0], books.shape[0], group_size)
+    scale = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+    normalized = values / scale
+    quantized = torch.empty_like(normalized)
+    for group in range(books.shape[0]):
+        assignment = (normalized[:, group, :, None] - books[group]).abs().argmin(dim=-1)
+        quantized[:, group, :] = books[group][assignment]
+    result = (quantized * scale).reshape(xtilde.shape[0], -1)
+    return result[:, :columns]
+
+
+def _quantized_state_prediction(
+    x: torch.Tensor,
+    d: torch.Tensor,
+    l1: torch.Tensor,
+    l2: torch.Tensor,
+    quantized_residual: torch.Tensor,
+    config: QuantConfig,
+) -> torch.Tensor:
+    xtilde = x / d
+    prediction = _quantize_activation(
+        xtilde, config.activation_bits, config.activation_group_size
+    ) @ quantized_residual
+    if l1.shape[1]:
+        prediction = prediction + (xtilde @ l1) @ l2
+    return prediction
+
+
+def build_reducible_oracle_teacher(
+    cached_x: torch.Tensor,
+    d: torch.Tensor,
+    l1: torch.Tensor,
+    l2: torch.Tensor,
+    quantized_residual: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Cross-fitted L2 projection of uniform error onto a non-uniform direction."""
+
+    rows = min(int(config.reducible_oracle_tokens), cached_x.shape[0])
+    x = cached_x[:rows].to(device=d.device, dtype=torch.float32)
+    fit_index = torch.arange(0, rows, 2, device=x.device)
+    test_index = torch.arange(1, rows, 2, device=x.device)
+    xtilde = x / d
+    q_uniform = _quantize_activation(
+        xtilde, config.activation_bits, config.activation_group_size
+    )
+    levels = 2 * (2 ** (config.activation_bits - 1) - 1) + 1
+    books, group_size, pad = _fit_reducible_codebooks(
+        xtilde[fit_index],
+        config.activation_group_size,
+        levels,
+        config.reducible_oracle_iters,
+    )
+    q_oracle = _apply_reducible_codebooks(xtilde, books, group_size, pad)
+    activation_error = (xtilde - q_uniform) @ quantized_residual
+    direction = (q_oracle - q_uniform) @ quantized_residual
+    alpha = (
+        (activation_error[fit_index] * direction[fit_index]).sum()
+        / direction[fit_index].square().sum().clamp_min(1e-30)
+    ).clamp(0.0, 1.0)
+    reducible = direction * alpha
+    base_prediction = _quantized_state_prediction(
+        x, d, l1, l2, quantized_residual, config
+    )
+    teacher = base_prediction + reducible
+    irreducible = activation_error - reducible
+    fit_cross = 2.0 * (reducible[fit_index] * irreducible[fit_index]).mean()
+    test_cross = 2.0 * (reducible[test_index] * irreducible[test_index]).mean()
+    test_uniform = activation_error[test_index].square().mean().clamp_min(1e-30)
+    diagnostics = {
+        "reducible_alpha": float(alpha.item()),
+        "reducible_fit_mse": float(reducible[fit_index].square().mean().item()),
+        "reducible_test_mse": float(reducible[test_index].square().mean().item()),
+        "irreducible_test_mse": float(irreducible[test_index].square().mean().item()),
+        "reducible_fit_cross": float(fit_cross.item()),
+        "reducible_test_normalized_cross": float((test_cross / test_uniform).item()),
+        "reducible_oracle_gain": float(
+            1.0 - irreducible[test_index].square().mean().div(test_uniform).item()
+        ),
+    }
+    return x, teacher, fit_index, test_index, diagnostics
+
+
 def activation_noise_diagonal(
     cached_x: torch.Tensor,
     d: torch.Tensor,
@@ -697,22 +915,78 @@ def _quantize_activation(inputs: torch.Tensor, bits: int, group_size: int = 0) -
 
     group_size 0 (or >= c) keeps the single per-token max across all channels.
     """
+    quantized, _codes, _scales = _quantize_activation_with_codes(inputs, bits, group_size)
+    return quantized
+
+
+def _quantize_activation_with_codes(
+    inputs: torch.Tensor,
+    bits: int,
+    group_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return dequantized activations plus integer codes and group scales."""
     if bits >= 16:
-        return inputs
+        codes = torch.zeros_like(inputs, dtype=torch.int16)
+        scales = torch.ones(*inputs.shape[:-1], 1, device=inputs.device, dtype=inputs.dtype)
+        return inputs, codes, scales
     qmax = float(2 ** (bits - 1) - 1)
     columns = inputs.shape[-1]
-    if group_size <= 0 or group_size >= columns:
-        scale = inputs.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
-        return torch.round(inputs / scale).clamp(-qmax, qmax) * scale
+    group_size = columns if group_size <= 0 or group_size >= columns else group_size
     lead = inputs.shape[:-1]
     num_groups = (columns + group_size - 1) // group_size
     pad = num_groups * group_size - columns
     padded = inputs if not pad else F.pad(inputs, (0, pad))
     grouped = padded.reshape(*lead, num_groups, group_size)
     scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
-    quantized = torch.round(grouped / scale).clamp(-qmax, qmax) * scale
+    codes = torch.round(grouped / scale).clamp(-qmax, qmax)
+    quantized = codes * scale
     quantized = quantized.reshape(*lead, num_groups * group_size)
-    return quantized[..., :columns] if pad else quantized
+    codes = codes.reshape(*lead, num_groups * group_size).to(torch.int16)
+    if pad:
+        quantized = quantized[..., :columns]
+        codes = codes[..., :columns]
+    return quantized, codes, scale.squeeze(-1)
+
+
+def _activation_group_centers(inputs: torch.Tensor, group_size: int) -> torch.Tensor:
+    columns = inputs.shape[-1]
+    group_size = columns if group_size <= 0 or group_size >= columns else group_size
+    lead = inputs.shape[:-1]
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    padded = inputs if not pad else F.pad(inputs, (0, pad))
+    return padded.reshape(*lead, num_groups, group_size).mean(dim=-1)
+
+
+def _activation_code_histograms(codes: torch.Tensor, bits: int, group_size: int) -> torch.Tensor:
+    columns = codes.shape[-1]
+    group_size = columns if group_size <= 0 or group_size >= columns else group_size
+    lead = codes.shape[:-1]
+    rows = math.prod(lead) if lead else 1
+    qmax = int(2 ** (bits - 1) - 1)
+    levels = 2 * qmax + 1
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    flat = codes.reshape(rows, columns)
+    padded = flat if not pad else F.pad(flat, (0, pad), value=0)
+    grouped = padded.reshape(rows, num_groups, group_size).long() + qmax
+    hist = torch.zeros((rows, num_groups, levels), device=codes.device, dtype=torch.float32)
+    hist.scatter_add_(2, grouped.clamp(0, levels - 1), torch.ones_like(grouped, dtype=torch.float32))
+    return hist.reshape(*lead, num_groups * levels)
+
+
+def _normalized_activation_mask(inputs: torch.Tensor, group_size: int, threshold: float) -> torch.Tensor:
+    columns = inputs.shape[-1]
+    group_size = columns if group_size <= 0 or group_size >= columns else group_size
+    lead = inputs.shape[:-1]
+    num_groups = (columns + group_size - 1) // group_size
+    pad = num_groups * group_size - columns
+    padded = inputs if not pad else F.pad(inputs, (0, pad))
+    grouped = padded.reshape(*lead, num_groups, group_size)
+    rms = grouped.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+    mask = (grouped.abs() / rms) > float(threshold)
+    mask = mask.reshape(*lead, num_groups * group_size)
+    return mask[..., :columns] if pad else mask
 
 
 def _mse(left: torch.Tensor, right: torch.Tensor) -> float:
@@ -999,6 +1273,270 @@ def _state_error(
     return float(((hessian @ error) * error).sum().div(error.shape[1]).item())
 
 
+def _factor_branch_matrix(
+    hessian: torch.Tensor,
+    branch: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank-r factorization of a branch matrix in the H^{1/2} gauge."""
+
+    return weighted_low_rank(
+        hessian,
+        branch,
+        config,
+        rank=config.rank,
+        beta=0.5,
+    )
+
+
+def reducible_fixed_code_branch_correction(
+    cached_x: torch.Tensor,
+    d: torch.Tensor,
+    current_l1: torch.Tensor,
+    current_l2: torch.Tensor,
+    quantized_residual: torch.Tensor,
+    teacher_outputs: torch.Tensor,
+    config: QuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Absorb only the reducible residual into the FP branch at frozen codes.
+
+    Unlike a full teacher re-fit of L1/L2, this solves for an additive low-rank
+    correction B_delta matching (teacher - current_uniform_output), then
+    re-factors baseline_branch + B_delta.  That keeps F_irr / already-correct
+    mass out of the calibration update and is the operational form of eq. (9).
+    """
+
+    x = cached_x.to(device=current_l1.device, dtype=torch.float32)
+    xtilde = x / d
+    teacher = teacher_outputs.to(device=current_l1.device, dtype=torch.float32)
+    current = _quantized_state_prediction(
+        x, d, current_l1, current_l2, quantized_residual, config
+    )
+    delta = teacher - current
+    rows = max(1, xtilde.shape[0])
+    empirical_hessian = _sym(xtilde.T @ xtilde / float(rows))
+    cross = xtilde.T @ delta / float(rows)
+    unconstrained = torch.linalg.solve(
+        _regularize_hessian(empirical_hessian, config.damp),
+        cross,
+    )
+    # Rank-1 is the natural match to the scalar projection alpha used when
+    # constructing the reducible teacher; allow up to rank when it helps fit.
+    corr_rank = 1 if config.rank <= 1 else min(2, config.rank)
+    delta_l1, delta_l2 = weighted_low_rank(
+        empirical_hessian,
+        unconstrained,
+        config,
+        rank=corr_rank,
+        beta=0.5,
+    )
+    proposal_branch = current_l1 @ current_l2 + delta_l1 @ delta_l2
+    proposal_l1, proposal_l2 = _factor_branch_matrix(
+        empirical_hessian, proposal_branch, config
+    )
+    current_error = (teacher - current).square().mean()
+    proposal = _quantized_state_prediction(
+        x, d, proposal_l1, proposal_l2, quantized_residual, config
+    )
+    proposal_error = (teacher - proposal).square().mean()
+    accepted = bool(proposal_error <= current_error * (1.0 + 1e-6))
+    gain = float(((current_error - proposal_error) / current_error.clamp_min(1e-30)).item())
+    diagnostics = {
+        "rotation_fixed_code_mse_before": float(current_error.item()),
+        "rotation_fixed_code_mse_after": float(proposal_error.item()),
+        "rotation_fixed_code_gain": gain,
+        "rotation_fixed_code_accepted": float(accepted),
+        "reducible_correction_rank": float(corr_rank),
+    }
+    if not accepted:
+        return current_l1, current_l2, diagnostics
+    return proposal_l1, proposal_l2, diagnostics
+
+
+@torch.no_grad()
+def _joint_quantize_reducible_from_v2(
+    layer: nn.Linear,
+    hessian: torch.Tensor,
+    cached_x: torch.Tensor,
+    config: QuantConfig,
+    target_weight: torch.Tensor | None,
+    target_outputs: torch.Tensor | None,
+    objective_diagnostics: dict[str, float] | None,
+) -> dict[str, Any]:
+    """Use the validated V2 solution as fallback, then optimize only F_A^red.
+
+    Matches the reformulation (eq. 9): keep the uniform forward path and the
+    V2 codes/scales/D frozen, then search only over the FP branch (L1, L2) for
+    held-out reducible-teacher mismatch under the F_W trust region
+    F_W <= (1+epsilon) F_W^(0).  The irreducible floor never enters the
+    objective; V2 remains the feasible fallback when no eligible branch update
+    improves F_A^red.
+    """
+
+    baseline_config = replace(
+        config,
+        activation_objective="full",
+        joint_rotation_mode="none",
+    )
+    baseline = joint_quantize_linear(
+        layer,
+        hessian,
+        cached_x,
+        baseline_config,
+        target_weight=target_weight,
+        target_outputs=target_outputs,
+        objective_diagnostics=objective_diagnostics,
+    )
+    device = layer.weight.device
+    original_dtype = layer.weight.dtype
+    local_weight = layer.weight.detach().T.float()
+    weight = local_weight if target_weight is None else target_weight.to(device=device, dtype=torch.float32)
+    hessian = hessian.to(device=device, dtype=torch.float32)
+    d = baseline["d"].to(device=device, dtype=torch.float32)
+    l1 = baseline["l1"].to(device=device, dtype=torch.float32)
+    l2 = baseline["l2"].to(device=device, dtype=torch.float32)
+    codes = baseline["codes"].to(device=device)
+    scales = baseline["scales"].to(device=device, dtype=torch.float32)
+    qres = _dequantize_codes(codes, scales, int(baseline["group_size"])).T.contiguous()
+    (
+        oracle_x,
+        oracle_teacher,
+        fit_index,
+        test_index,
+        teacher_diagnostics,
+    ) = build_reducible_oracle_teacher(cached_x, d, l1, l2, qres, config)
+    baseline_prediction = _quantized_state_prediction(
+        oracle_x[test_index], d, l1, l2, qres, config
+    )
+    baseline_red_error = float(
+        (baseline_prediction - oracle_teacher[test_index]).square().mean().item()
+    )
+    red_fit = float(teacher_diagnostics["reducible_fit_mse"])
+    irr_test = float(teacher_diagnostics["irreducible_test_mse"])
+    reliability = red_fit / max(red_fit + irr_test, 1e-30)
+    fw_anchor = float(baseline["fw"])
+    fw_limit = fw_anchor * (1.0 + config.joint_rotation_fw_epsilon)
+    htilde = hessian / d[:, None] / d[None, :]
+    wtilde = d[:, None] * weight
+    baseline_branch = l1 @ l2
+    best = dict(baseline)
+    best.update(
+        {
+            "activation_objective": "reducible",
+            "joint_rotation_mode": "empirical",
+            "joint_rotation_fw_epsilon": config.joint_rotation_fw_epsilon,
+            "error": baseline_red_error,
+            "full_error": float(baseline.get("full_error", baseline.get("error", 0.0))),
+            "fw_trust_anchor": fw_anchor,
+            "fw_trust_limit": fw_limit,
+            "fw_trust_eligible_rotations": 0,
+            "fw_trust_total_rotations": 0,
+            "reducible_teacher_diagnostics": dict(teacher_diagnostics),
+            "reducible_reliability": float(reliability),
+            "reducible_source": "v2_fallback",
+            "reducible_accepted_updates": 0,
+            "reducible_refine_history": [],
+        }
+    )
+    proposal_l1, proposal_l2, rotation_diagnostics = reducible_fixed_code_branch_correction(
+        oracle_x[fit_index],
+        d,
+        l1,
+        l2,
+        qres,
+        oracle_teacher[fit_index],
+        config,
+    )
+    proposal_branch = proposal_l1 @ proposal_l2
+    # Closed-form additive correction, then trust-region line search toward it.
+    # Codes/D stay frozen so F_A^red is not mixed with a fresh GPTQ residual.
+    default_scales = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+    configured = tuple(
+        float(scale) for scale in config.trajectory_backtrack_scales if float(scale) > 0
+    )
+    line_scales = tuple(sorted(set(configured or default_scales)))
+    refine_history: list[dict[str, Any]] = []
+    eligible = 0
+    accepted = 0
+    for scale in line_scales:
+        branch = (1.0 - scale) * baseline_branch + scale * proposal_branch
+        cand_l1, cand_l2 = _factor_branch_matrix(htilde, branch, config)
+        terms = joint_surrogate_terms(
+            htilde,
+            wtilde,
+            cand_l1,
+            cand_l2,
+            qres,
+            torch.zeros_like(d),
+            0.0,
+        )
+        prediction = _quantized_state_prediction(
+            oracle_x[test_index], d, cand_l1, cand_l2, qres, config
+        )
+        red_error = float(
+            (prediction - oracle_teacher[test_index]).square().mean().item()
+        )
+        full_error = _state_error(
+            weight,
+            hessian,
+            cached_x,
+            d,
+            cand_l1,
+            cand_l2,
+            qres,
+            config.activation_bits,
+            config.activation_group_size,
+            target_outputs,
+        )
+        is_eligible = float(terms["fw"]) <= fw_limit * (1.0 + 1e-7)
+        eligible += int(is_eligible)
+        red_gain = (baseline_red_error - red_error) / max(baseline_red_error, 1e-30)
+        diagnostics = {
+            "line_scale": float(scale),
+            "state_mse": red_error,
+            "full_state_mse": full_error,
+            "fw": float(terms["fw"]),
+            "fw_ratio": float(terms["fw"]) / max(fw_anchor, 1e-30),
+            "fw_eligible": float(is_eligible),
+            "reducible_heldout_gain": float(red_gain),
+            "reducible_reliability": float(reliability),
+            **teacher_diagnostics,
+            **rotation_diagnostics,
+        }
+        refine_history.append(diagnostics)
+        if is_eligible and red_error < float(best["error"]):
+            accepted += 1
+            candidate = dict(best)
+            candidate.update(
+                {
+                    "d": d.detach().to("cpu", dtype=torch.float32),
+                    "l1": cand_l1.detach().to("cpu", dtype=original_dtype),
+                    "l2": cand_l2.detach().to("cpu", dtype=original_dtype),
+                    "codes": codes.detach().to("cpu"),
+                    "scales": scales.detach().to("cpu", dtype=original_dtype),
+                    "error": red_error,
+                    "full_error": full_error,
+                    "fw": float(terms["fw"]),
+                    "outer_iteration": int(baseline.get("outer_iteration", 0)),
+                    "joint_code_iteration": int(baseline.get("joint_code_iteration", 0)),
+                    "joint_diagnostics": list(baseline.get("joint_diagnostics", []))
+                    + list(refine_history),
+                    "reducible_source": "fixed_code_refine",
+                    "reducible_line_scale": float(scale),
+                }
+            )
+            best = candidate
+
+    best["fw_trust_eligible_rotations"] = eligible
+    best["fw_trust_total_rotations"] = len(line_scales)
+    best["reducible_accepted_updates"] = accepted
+    best["reducible_refine_history"] = refine_history
+    best["history"] = list(baseline.get("history", [])) + [
+        row["state_mse"] for row in refine_history
+    ]
+    return best
+
+
 @torch.no_grad()
 def joint_quantize_linear(
     layer: nn.Linear,
@@ -1017,6 +1555,18 @@ def joint_quantize_linear(
     """
 
     config.validate()
+    if config.activation_objective == "reducible":
+        if cached_x is None:
+            raise ValueError("reducible activation objective requires cached activations")
+        return _joint_quantize_reducible_from_v2(
+            layer,
+            hessian,
+            cached_x,
+            config,
+            target_weight,
+            target_outputs,
+            objective_diagnostics,
+        )
     device = layer.weight.device
     original_dtype = layer.weight.dtype
     local_weight = layer.weight.detach().T.float()  # [in, out]
@@ -1034,6 +1584,11 @@ def joint_quantize_linear(
     previous_l2: torch.Tensor | None = None
     best: dict[str, Any] | None = None
     history: list[float] = []
+    reducible_x: torch.Tensor | None = None
+    reducible_teacher: torch.Tensor | None = None
+    reducible_fit_index: torch.Tensor | None = None
+    reducible_test_index: torch.Tensor | None = None
+    reducible_teacher_diagnostics: dict[str, float] = {}
 
     for outer in range(config.outer_iters):
         if previous_a is None:
@@ -1089,10 +1644,22 @@ def joint_quantize_linear(
             l1, l2_initial = weighted_low_rank(htilde, wtilde, config)
 
         inner_iters = config.joint_code_iters if config.code_objective == "joint" else 1
+        # Keep the unrotated candidates so empirical rotation can be admitted
+        # against the F_W value of the exact V2 solution selected without it.
+        # This makes F_W^(0) a genuine per-module trust-region anchor rather
+        # than approximating it with equal rank or a fixed-code comparison.
+        if outer == 0:
+            unrotated_candidates: list[dict[str, Any]] = []
+            rotated_candidates: list[dict[str, Any]] = []
         inner_history: list[dict[str, Any]] = []
+        incoming_rotation_diagnostics: dict[str, float] = {}
         for joint_iteration in range(inner_iters):
             hperp_tilde = _hessian_deflate(htilde, l1)
-            if config.code_objective == "joint" and config.activation_bits < 16:
+            if (
+                config.activation_objective == "full"
+                and config.code_objective == "joint"
+                and config.activation_bits < 16
+            ):
                 target, code_metric, prepared_upper, metric_jitter = joint_code_target(
                     hperp_tilde,
                     wtilde,
@@ -1128,9 +1695,9 @@ def joint_quantize_linear(
                 l2,
                 quantized_residual,
                 sigma_a,
-                config.activation_weight,
+                config.activation_weight if config.activation_objective == "full" else 0.0,
             )
-            error = _state_error(
+            full_error = _state_error(
                 weight,
                 hessian,
                 cached_x_device,
@@ -1142,6 +1709,39 @@ def joint_quantize_linear(
                 config.activation_group_size,
                 target_outputs,
             )
+            if config.activation_objective == "reducible":
+                if cached_x_device is None:
+                    raise ValueError("reducible activation objective requires cached activations")
+                if reducible_teacher is None:
+                    (
+                        reducible_x,
+                        reducible_teacher,
+                        reducible_fit_index,
+                        reducible_test_index,
+                        reducible_teacher_diagnostics,
+                    ) = build_reducible_oracle_teacher(
+                        cached_x_device,
+                        d,
+                        l1,
+                        l2,
+                        quantized_residual,
+                        config,
+                    )
+                assert reducible_x is not None
+                assert reducible_test_index is not None
+                prediction = _quantized_state_prediction(
+                    reducible_x[reducible_test_index],
+                    d,
+                    l1,
+                    l2,
+                    quantized_residual,
+                    config,
+                )
+                error = float(
+                    (prediction - reducible_teacher[reducible_test_index]).square().mean().item()
+                )
+            else:
+                error = full_error
             history.append(error)
             inner_history.append(
                 {
@@ -1149,6 +1749,8 @@ def joint_quantize_linear(
                     "state_mse": error,
                     "target_norm_ratio": target_norm_ratio,
                     "metric_jitter": metric_jitter,
+                    **incoming_rotation_diagnostics,
+                    **reducible_teacher_diagnostics,
                     **terms,
                 }
             )
@@ -1168,34 +1770,91 @@ def joint_quantize_linear(
                 "activation_bits": config.activation_bits,
                 "activation_group_size": config.activation_group_size,
                 "code_objective": config.code_objective,
+                "joint_rotation_mode": config.joint_rotation_mode,
+                "joint_rotation_fw_epsilon": config.joint_rotation_fw_epsilon,
+                "activation_objective": config.activation_objective,
                 "joint_code_iteration": joint_iteration,
                 "joint_diagnostics": list(inner_history),
                 "sigma_a_mean": float(sigma_a.mean().item()),
                 "sigma_a_max": float(sigma_a.max().item()),
                 "error": error,
+                "full_error": full_error,
                 "outer_iteration": outer,
                 "rank_split": dict(split),
                 "linear_objective": config.linear_objective,
                 "ablation_mode": config.ablation_mode,
                 "objective_diagnostics": dict(objective_diagnostics or {}),
+                "fw": float(terms["fw"]),
             }
+            if config.joint_rotation_mode == "empirical":
+                if joint_iteration == 0:
+                    unrotated_candidates.append(candidate)
+                else:
+                    rotated_candidates.append(candidate)
             if best is None or error < best["error"]:
                 best = candidate
 
             if joint_iteration + 1 < inner_iters:
-                # Exact fixed-Q branch block: fit the rank-r branch to what the
-                # activation-aware quantized path did not carry.  beta=1/2 is
-                # weighted Eckart-Young in the H metric.
-                l1, l2_initial = weighted_low_rank(
-                    htilde,
-                    wtilde - quantized_residual,
-                    config,
-                    rank=config.rank,
-                    beta=0.5,
-                )
+                if config.joint_rotation_mode == "empirical":
+                    if cached_x_device is None:
+                        raise ValueError(
+                            "empirical joint rotation requires --activation-cache-tokens > 0"
+                        )
+                    rotation_x = cached_x_device
+                    rotation_target = target_outputs
+                    if config.activation_objective == "reducible":
+                        assert reducible_x is not None
+                        assert reducible_fit_index is not None
+                        assert reducible_teacher is not None
+                        rotation_x = reducible_x[reducible_fit_index]
+                        rotation_target = reducible_teacher[reducible_fit_index]
+                    l1, l2_initial, incoming_rotation_diagnostics = empirical_joint_branch_update(
+                        rotation_x,
+                        d,
+                        weight,
+                        quantized_residual,
+                        l1,
+                        l2,
+                        config,
+                        rotation_target,
+                    )
+                else:
+                    # Exact fixed-Q surrogate branch block: fit the rank-r
+                    # branch to what the quantized path did not carry.
+                    l1, l2_initial = weighted_low_rank(
+                        htilde,
+                        wtilde - quantized_residual,
+                        config,
+                        rank=config.rank,
+                        beta=0.5,
+                    )
+                    incoming_rotation_diagnostics = {}
 
         previous_a = l1 / d[:, None]
         previous_l2 = l2
+
+    if config.joint_rotation_mode == "empirical":
+        if not unrotated_candidates:
+            raise RuntimeError("empirical joint rotation produced no unrotated F_W anchor")
+        if config.activation_objective == "reducible":
+            # The first FW-only state defines both the frozen oracle teacher
+            # and F_W^(0); every later D/L/Z candidate is compared to that one
+            # cross-fitted objective and cannot move the trust-region anchor.
+            baseline_best = unrotated_candidates[0]
+            alternatives = [*unrotated_candidates[1:], *rotated_candidates]
+        else:
+            baseline_best = min(unrotated_candidates, key=lambda state: state["error"])
+            alternatives = list(rotated_candidates)
+        fw_anchor = float(baseline_best["fw"])
+        fw_limit = fw_anchor * (1.0 + config.joint_rotation_fw_epsilon)
+        eligible_rotated = [
+            state for state in alternatives if float(state["fw"]) <= fw_limit * (1.0 + 1e-7)
+        ]
+        best = min([baseline_best, *eligible_rotated], key=lambda state: state["error"])
+        best["fw_trust_anchor"] = fw_anchor
+        best["fw_trust_limit"] = fw_limit
+        best["fw_trust_eligible_rotations"] = len(eligible_rotated)
+        best["fw_trust_total_rotations"] = len(rotated_candidates)
 
     assert best is not None
     best["history"] = history
@@ -1222,6 +1881,31 @@ class HSVQuantLinear(nn.Module):
         bias = state.get("bias")
         self.register_buffer("bias", None if bias is None else bias.to(dtype=dtype))
         self.register_buffer("_qweight", self._build_qweight(dtype), persistent=False)
+        correction = state.get("correction") or {}
+        dc = correction.get("dc_coeff")
+        if dc is None and isinstance(correction.get("dc"), dict):
+            dc = correction["dc"].get("coeff")
+        lut = correction.get("lut_coeff")
+        if lut is None and isinstance(correction.get("lut"), dict):
+            lut = correction["lut"].get("coeff")
+        sparse = correction.get("sparse") if isinstance(correction.get("sparse"), dict) else {}
+        sparse_threshold = correction.get("sparse_threshold", sparse.get("threshold", None))
+        generic = correction.get("generic") if isinstance(correction.get("generic"), dict) else {}
+        generic_left = correction.get("generic_left", generic.get("left", None))
+        generic_right = correction.get("generic_right", generic.get("right", None))
+        if (generic_left is None) != (generic_right is None):
+            raise ValueError("generic correction requires both left and right factors")
+        self.register_buffer("correction_dc", None if dc is None else dc.to(dtype=dtype))
+        self.register_buffer("correction_lut", None if lut is None else lut.to(dtype=dtype))
+        self.register_buffer(
+            "correction_generic_left",
+            None if generic_left is None else generic_left.to(dtype=dtype),
+        )
+        self.register_buffer(
+            "correction_generic_right",
+            None if generic_right is None else generic_right.to(dtype=dtype),
+        )
+        self.correction_sparse_threshold = None if sparse_threshold is None else float(sparse_threshold)
 
     def _build_qweight(self, dtype: torch.dtype | None = None) -> torch.Tensor:
         dtype = dtype or self.scales.dtype
@@ -1232,10 +1916,38 @@ class HSVQuantLinear(nn.Module):
             self._qweight = self._build_qweight(inputs.dtype).to(inputs.device)
         d = self.d.to(dtype=inputs.dtype)
         smoothed = inputs / d
-        quantized_inputs = _quantize_activation(smoothed, self.activation_bits, self.activation_group_size)
+        quantized_inputs, activation_codes, _activation_scales = _quantize_activation_with_codes(
+            smoothed,
+            self.activation_bits,
+            self.activation_group_size,
+        )
         output = F.linear(quantized_inputs, self._qweight, None)
         if self.l1.shape[1]:
             output = output + (smoothed @ self.l1.to(inputs.dtype)) @ self.l2.to(inputs.dtype)
+        if self.correction_dc is not None:
+            centers = _activation_group_centers(smoothed, self.activation_group_size)
+            output = output + centers.to(inputs.dtype) @ self.correction_dc.to(inputs.dtype)
+        if self.correction_lut is not None:
+            hist = _activation_code_histograms(
+                activation_codes,
+                self.activation_bits,
+                self.activation_group_size,
+            )
+            coeff = self.correction_lut.to(inputs.dtype).reshape(-1, self.out_features)
+            output = output + hist.to(inputs.dtype) @ coeff
+        if self.correction_sparse_threshold is not None:
+            mask = _normalized_activation_mask(
+                smoothed,
+                self.activation_group_size,
+                self.correction_sparse_threshold,
+            )
+            sparse_residual = (smoothed - quantized_inputs) * mask.to(dtype=inputs.dtype)
+            output = output + F.linear(sparse_residual, self._qweight, None)
+        if self.correction_generic_left is not None:
+            activation_residual = smoothed - quantized_inputs
+            output = output + (
+                activation_residual @ self.correction_generic_left.to(inputs.dtype)
+            ) @ self.correction_generic_right.to(inputs.dtype)
         if self.bias is not None:
             output = output + self.bias.to(inputs.dtype)
         return output
@@ -1975,6 +2687,11 @@ def quantize_command(args: argparse.Namespace) -> None:
         rank_a_mode=args.rank_a_mode,
         code_objective=ablation["code_objective"],
         joint_code_iters=ablation["joint_code_iters"],
+        joint_rotation_mode=args.joint_rotation_mode,
+        joint_rotation_fw_epsilon=args.joint_rotation_fw_epsilon,
+        activation_objective=args.activation_objective,
+        reducible_oracle_tokens=args.reducible_oracle_tokens,
+        reducible_oracle_iters=args.reducible_oracle_iters,
         block_input_mode=ablation["block_input_mode"],
         intra_block_mode=args.intra_block_mode,
         linear_objective=ablation["linear_objective"],
@@ -2013,6 +2730,8 @@ def quantize_command(args: argparse.Namespace) -> None:
     print(
         "[H-SVDQuant] resolved ablation "
         f"mode={config.ablation_mode}, code={config.code_objective}, "
+        f"rotation={config.joint_rotation_mode}, "
+        f"activation_objective={config.activation_objective}, "
         f"trajectory={config.linear_objective}, lambda={config.activation_weight:g}, "
         f"block_input={config.block_input_mode}, intra_block={config.intra_block_mode}, "
         f"W{config.bits}A{config.activation_bits}, "
@@ -2087,6 +2806,7 @@ def self_test_command(_args: argparse.Namespace) -> None:
         rank=3,
         code_objective="joint",
         joint_code_iters=2,
+        joint_rotation_mode="empirical",
         beta=0.5,
         p=2,
         group_size=8,
@@ -2101,10 +2821,23 @@ def self_test_command(_args: argparse.Namespace) -> None:
     output = quantized(x)
     assert output.shape == (96, out_features)
     assert torch.isfinite(output).all()
+    correction_state = dict(state)
+    correction_groups = math.ceil(in_features / config.activation_group_size)
+    correction_levels = 2 * (2 ** (config.activation_bits - 1) - 1) + 1
+    correction_state["correction"] = {
+        "dc_coeff": torch.zeros(correction_groups, out_features),
+        "lut_coeff": torch.zeros(correction_groups, correction_levels, out_features),
+        "sparse_threshold": 99.0,
+        "generic_left": torch.zeros(in_features, 2),
+        "generic_right": torch.zeros(2, out_features),
+    }
+    corrected = HSVQuantLinear(correction_state, compute_dtype=torch.float32)
+    assert torch.allclose(output, corrected(x), atol=1e-6, rtol=1e-5)
     assert state["codes"].dtype == torch.int8
     assert len(state["history"]) == 4
     assert state["activation_group_size"] == 4
     assert state["code_objective"] == "joint"
+    assert state["joint_rotation_mode"] == "empirical"
     assert state["joint_diagnostics"]
     assert quantized.activation_group_size == 4
     propagated_x = x + 0.05 * torch.randn_like(x)
@@ -2126,12 +2859,37 @@ def self_test_command(_args: argparse.Namespace) -> None:
         objective_diagnostics=diagnostics,
     )
     assert cumulative_state["objective_diagnostics"]["correction_norm_ratio"] > 0
+    reducible_config = replace(
+        config,
+        activation_bits=4,
+        activation_group_size=4,
+        activation_objective="reducible",
+        joint_rotation_mode="empirical",
+        joint_code_iters=2,
+        joint_rotation_fw_epsilon=0.05,
+        trajectory_backtrack_scales=(0.125, 0.25, 0.5, 1.0),
+        reducible_oracle_tokens=64,
+        reducible_oracle_iters=3,
+    )
+    reducible_state = joint_quantize_linear(layer, hessian, x, reducible_config)
+    assert reducible_state["activation_objective"] == "reducible"
+    assert reducible_state["reducible_source"] in {"v2_fallback", "fixed_code_refine"}
+    assert "reducible_teacher_diagnostics" in reducible_state
+    assert "reducible_refine_history" in reducible_state
+    assert reducible_state["fw"] <= reducible_state["fw_trust_limit"] * (1.0 + 1e-6)
+    reducible_module = HSVQuantLinear(reducible_state, compute_dtype=torch.float32)
+    assert torch.isfinite(reducible_module(x)).all()
     print(
         json.dumps(
             {
                 "status": "ok",
                 "history": state["history"],
                 "dense_weight_shape": list(quantized.dense_weight().shape),
+                "reducible_source": reducible_state["reducible_source"],
+                "reducible_accepted_updates": reducible_state["reducible_accepted_updates"],
+                "reducible_oracle_gain": reducible_state["reducible_teacher_diagnostics"][
+                    "reducible_oracle_gain"
+                ],
             },
             indent=2,
         )
@@ -2278,6 +3036,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="alternating joint code / exact fixed-code rank-r branch updates (joint mode only)",
     )
+    quantize.add_argument(
+        "--joint-rotation-mode",
+        choices=["none", "empirical"],
+        default="none",
+        help=(
+            "none: legacy H-metric fixed-code branch update; empirical: rotate the rank-r branch "
+            "against the exact cached W4A4 output before requantizing residual codes"
+        ),
+    )
+    quantize.add_argument(
+        "--joint-rotation-fw-epsilon",
+        type=float,
+        default=0.0,
+        help="admit a rotated/requantized candidate only if F_W <= (1+epsilon) F_W^(0)",
+    )
+    quantize.add_argument(
+        "--activation-objective",
+        choices=["full", "reducible"],
+        default="full",
+        help="full: V2 total activation penalty; reducible: cross-fitted non-uniform projection teacher",
+    )
+    quantize.add_argument("--reducible-oracle-tokens", type=int, default=512)
+    quantize.add_argument("--reducible-oracle-iters", type=int, default=5)
     quantize.add_argument(
         "--block-input-mode",
         choices=["quantized", "reference"],
