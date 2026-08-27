@@ -5,6 +5,7 @@ outputs/
 *.pyc
 models/*
 results/
-scripts/
+# scripts/
 tmp*
 docs*
+

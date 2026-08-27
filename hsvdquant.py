@@ -2057,13 +2057,45 @@ class _StopForward(RuntimeError):
     pass
 
 
+def _decoder_layers(model: nn.Module) -> nn.ModuleList:
+    """Return the decoder stack for causal LMs or Qwen2.5-VL language towers."""
+    if hasattr(model, "model"):
+        inner = model.model
+        if hasattr(inner, "layers"):
+            return inner.layers
+        if hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+            return inner.language_model.layers
+    if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        return model.language_model.layers
+    raise TypeError("expected a Qwen/Llama causal LM or Qwen2.5-VL language_model.layers architecture")
+
+
+def _decoder_layer_prefix(model: nn.Module) -> str:
+    if hasattr(model, "model"):
+        inner = model.model
+        if hasattr(inner, "layers"):
+            return "model.layers"
+        if hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+            return "model.language_model.layers"
+    if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        return "language_model.layers"
+    raise TypeError("expected a Qwen/Llama causal LM or Qwen2.5-VL language_model.layers architecture")
+
+
+def _model_kind(model: nn.Module) -> str:
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    if model_type == "qwen2_5_vl" or _decoder_layer_prefix(model).endswith("language_model.layers"):
+        return "qwen2_5_vl"
+    return "causal_lm"
+
+
 @torch.no_grad()
 def capture_first_layer_inputs(
     model: nn.Module,
     batches: Iterable[dict[str, torch.Tensor]],
     device: torch.device,
 ) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
-    layers = model.model.layers
+    layers = _decoder_layers(model)
     hidden_batches: list[torch.Tensor] = []
     layer_kwargs: list[dict[str, Any]] = []
 
@@ -2138,7 +2170,8 @@ def quantize_qwen_model(
     max_layers: int = -1,
     seed: int = 0,
 ) -> dict[str, dict[str, Any]]:
-    layers = model.model.layers
+    layers = _decoder_layers(model)
+    layer_prefix = _decoder_layer_prefix(model)
     states: dict[str, dict[str, Any]] = {}
     layer_count = len(layers) if max_layers < 0 else min(max_layers, len(layers))
     propagated_hidden_batches = hidden_batches
@@ -2314,7 +2347,7 @@ def quantize_qwen_model(
                     local_state["objective_diagnostics"]["trajectory_quantized_reverted"] = 1.0
                     local_state["error"] = float(local_teacher_error)
                     state = local_state
-            full_name = f"model.layers.{layer_index}.{name}"
+            full_name = f"{layer_prefix}.{layer_index}.{name}"
             states[full_name] = state
             print(
                 f"  {name}: best_mse={state['error']:.6e}, "
@@ -2462,7 +2495,7 @@ def quantize_qwen_model(
             }
             for group in sequential_groups:
                 for name in group:
-                    states[f"model.layers.{layer_index}.{name}"][
+                    states[f"{layer_prefix}.{layer_index}.{name}"][
                         "block_trajectory_diagnostics"
                     ] = block_diagnostics
         torch.cuda.empty_cache() if device.type == "cuda" else None
@@ -2530,6 +2563,7 @@ def save_quant_checkpoint(
     states: dict[str, dict[str, Any]],
     config: QuantConfig,
     args: argparse.Namespace,
+    model_kind: str = "causal_lm",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(output_dir)
@@ -2537,6 +2571,7 @@ def save_quant_checkpoint(
     metadata = {
         "format": "hsvdquant-v1",
         "base_model": model_name,
+        "model_kind": model_kind,
         "quant_config": asdict(config),
         "calibration": {
             "dataset": args.calib_dataset,
@@ -2561,10 +2596,24 @@ def load_quant_checkpoint(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     metadata = json.loads((checkpoint_dir / "hsvdquant_config.json").read_text(encoding="utf-8"))
-    model = AutoModelForCausalLM.from_pretrained(metadata["base_model"], torch_dtype=dtype)
+    model_kind = metadata.get("model_kind", "")
+    if not model_kind:
+        try:
+            model_type = AutoConfig.from_pretrained(metadata["base_model"]).model_type
+        except Exception:
+            model_type = ""
+        model_kind = "qwen2_5_vl" if model_type == "qwen2_5_vl" else "causal_lm"
+    if model_kind == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            metadata["base_model"], torch_dtype=dtype
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(metadata["base_model"], torch_dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, use_fast=True)
     try:
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu", weights_only=True)
@@ -2615,11 +2664,16 @@ def run_lm_eval(
 
 
 def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
-    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-        raise TypeError("this CLI currently expects a Qwen/Llama-style model.model.layers architecture")
+    model_type = AutoConfig.from_pretrained(model_name).model_type
+    if model_type == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    _decoder_layers(model)
     model.to(device).eval()
     model.config.use_cache = False
     return model
@@ -2751,6 +2805,7 @@ def quantize_command(args: argparse.Namespace) -> None:
     model = _load_model(args.model, device, dtype)
     hidden, kwargs = capture_first_layer_inputs(model, batches, device)
     del batches
+    model_kind = _model_kind(model)
     states = quantize_qwen_model(
         model,
         hidden,
@@ -2762,7 +2817,7 @@ def quantize_command(args: argparse.Namespace) -> None:
         args.max_layers,
         args.seed,
     )
-    save_quant_checkpoint(Path(args.output), args.model, tokenizer, states, config, args)
+    save_quant_checkpoint(Path(args.output), args.model, tokenizer, states, config, args, model_kind)
 
     if args.eval_tasks:
         results = run_lm_eval(
