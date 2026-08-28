@@ -1,7 +1,7 @@
 # Tested target environment: Python 3.10/3.11, CUDA 12.x.
 # Qwen3 requires transformers >= 4.52.4.
-torch>=2.4.0,<3
-transformers>=4.52.4,<5
+# torch>=2.4.0,<3
+# transformers>=4.52.4,<5
 accelerate>=1.0.1,<2
 datasets>=3.2.0,<5
 safetensors>=0.4.4

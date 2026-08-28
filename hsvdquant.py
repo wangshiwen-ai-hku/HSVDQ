@@ -18,6 +18,7 @@ This is a research implementation.  Integer codes are stored compactly as int8
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import json
 import math
@@ -191,7 +192,12 @@ def _hessian_deflate(hessian: torch.Tensor, basis: torch.Tensor | None, damp: fl
 
 
 class ActivationStats:
-    """Streaming H accumulator plus a bounded, uniform priority reservoir of X rows."""
+    """Streaming H accumulator plus a bounded, uniform priority reservoir of X rows.
+
+    Large Hessians (e.g. MLP down_proj) are accumulated on CPU by default so the
+    GPU peak stays available for GPTQ factorizations while inactive layers are
+    CPU-offloaded.
+    """
 
     def __init__(
         self,
@@ -200,12 +206,19 @@ class ActivationStats:
         cache_tokens: int,
         hessian_block_size: int = 4096,
         seed: int = 0,
+        hessian_device: torch.device | None = None,
     ) -> None:
         self.columns = columns
         self.device = device
         self.cache_tokens = max(0, cache_tokens)
         self.hessian_block_size = max(1, hessian_block_size)
-        self.hessian_sum = torch.zeros((columns, columns), device=device, dtype=torch.float32)
+        # Keep very large H on CPU; small H can stay on the compute device.
+        if hessian_device is None:
+            hessian_device = torch.device("cpu") if columns >= 8192 else device
+        self.hessian_device = hessian_device
+        self.hessian_sum = torch.zeros(
+            (columns, columns), device=self.hessian_device, dtype=torch.float32
+        )
         self.num_tokens = 0
         self._cache: torch.Tensor | None = None
         self._priorities: torch.Tensor | None = None
@@ -218,8 +231,11 @@ class ActivationStats:
         if rows.shape[1] != self.columns:
             raise ValueError(f"expected {self.columns} columns, got {rows.shape[1]}")
         for start in range(0, rows.shape[0], self.hessian_block_size):
-            block = rows[start : start + self.hessian_block_size].to(self.device, dtype=torch.float32)
+            block = rows[start : start + self.hessian_block_size].to(
+                self.hessian_device, dtype=torch.float32
+            )
             self.hessian_sum.addmm_(block.T, block)
+            del block
         self.num_tokens += rows.shape[0]
         if self.cache_tokens == 0:
             return
@@ -244,7 +260,7 @@ class ActivationStats:
         return hessian, cached
 
     def free(self) -> None:
-        self.hessian_sum = torch.empty(0, device=self.device)
+        self.hessian_sum = torch.empty(0)
         self._cache = None
         self._priorities = None
 
@@ -548,8 +564,15 @@ def _prepare_gptq_metric(
             hreg = hreg + torch.eye(hreg.shape[0], device=hreg.device, dtype=hreg.dtype) * extra
     if chol is None:
         raise RuntimeError("failed to stabilize quantization metric for GPTQ")
+    # Drop hreg before allocating hinv/upper so peak stays closer to 2x H.
+    del hreg
     hinv = torch.cholesky_inverse(chol)
-    return chol, torch.linalg.cholesky(hinv, upper=True)
+    del chol
+    upper = torch.linalg.cholesky(hinv, upper=True)
+    del hinv
+    # Caller only needs the upper factor for feedback; return a cheap placeholder
+    # for the unused first tuple slot to preserve the public signature.
+    return upper, upper
 
 
 def _prepare_joint_metric(
@@ -1880,7 +1903,10 @@ class HSVQuantLinear(nn.Module):
         self.register_buffer("scales", state["scales"].to(dtype=dtype))
         bias = state.get("bias")
         self.register_buffer("bias", None if bias is None else bias.to(dtype=dtype))
-        self.register_buffer("_qweight", self._build_qweight(dtype), persistent=False)
+        # Dense residual is rebuilt per forward and discarded. Caching it on every
+        # linear after the first eval pass roughly doubles weight VRAM vs compact codes.
+        self.register_buffer("_qweight", None, persistent=False)
+        self.persist_qweight = False
         correction = state.get("correction") or {}
         dc = correction.get("dc_coeff")
         if dc is None and isinstance(correction.get("dc"), dict):
@@ -1912,8 +1938,17 @@ class HSVQuantLinear(nn.Module):
         return _dequantize_codes(self.codes, self.scales, self.group_size).to(dtype=dtype)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if self._qweight.device != inputs.device or self._qweight.dtype != inputs.dtype:
-            self._qweight = self._build_qweight(inputs.dtype).to(inputs.device)
+        if (
+            self.persist_qweight
+            and self._qweight is not None
+            and self._qweight.device == inputs.device
+            and self._qweight.dtype == inputs.dtype
+        ):
+            qweight = self._qweight
+        else:
+            qweight = self._build_qweight(inputs.dtype).to(device=inputs.device, dtype=inputs.dtype)
+            if self.persist_qweight:
+                self._qweight = qweight
         d = self.d.to(dtype=inputs.dtype)
         smoothed = inputs / d
         quantized_inputs, activation_codes, _activation_scales = _quantize_activation_with_codes(
@@ -1921,7 +1956,7 @@ class HSVQuantLinear(nn.Module):
             self.activation_bits,
             self.activation_group_size,
         )
-        output = F.linear(quantized_inputs, self._qweight, None)
+        output = F.linear(quantized_inputs, qweight, None)
         if self.l1.shape[1]:
             output = output + (smoothed @ self.l1.to(inputs.dtype)) @ self.l2.to(inputs.dtype)
         if self.correction_dc is not None:
@@ -1942,7 +1977,7 @@ class HSVQuantLinear(nn.Module):
                 self.correction_sparse_threshold,
             )
             sparse_residual = (smoothed - quantized_inputs) * mask.to(dtype=inputs.dtype)
-            output = output + F.linear(sparse_residual, self._qweight, None)
+            output = output + F.linear(sparse_residual, qweight, None)
         if self.correction_generic_left is not None:
             activation_residual = smoothed - quantized_inputs
             output = output + (
@@ -1950,6 +1985,8 @@ class HSVQuantLinear(nn.Module):
             ) @ self.correction_generic_right.to(inputs.dtype)
         if self.bias is not None:
             output = output + self.bias.to(inputs.dtype)
+        if not self.persist_qweight:
+            self._qweight = None
         return output
 
     @torch.no_grad()
@@ -2094,10 +2131,16 @@ def capture_first_layer_inputs(
     model: nn.Module,
     batches: Iterable[dict[str, torch.Tensor]],
     device: torch.device,
+    *,
+    stage_minimal: bool = False,
 ) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
     layers = _decoder_layers(model)
     hidden_batches: list[torch.Tensor] = []
     layer_kwargs: list[dict[str, Any]] = []
+    staged: list[nn.Module] = []
+    if stage_minimal:
+        # Avoid putting the full FP16/BF16 model on GPU just to grab layer-0 inputs.
+        staged = _stage_first_layer_for_capture(model, device)
 
     def pre_hook(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         hidden_batches.append(args[0].detach().to("cpu"))
@@ -2114,6 +2157,10 @@ def capture_first_layer_inputs(
                 pass
     finally:
         handle.remove()
+        if stage_minimal:
+            for module in staged:
+                module.to("cpu")
+            _cuda_empty_cache(device)
     if not hidden_batches:
         raise RuntimeError("failed to capture the first decoder-layer inputs")
     return hidden_batches, layer_kwargs
@@ -2158,6 +2205,79 @@ def _paired_batch_stats(
     }
 
 
+def _cuda_empty_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _offload_decoder_layers_except(
+    model: nn.Module,
+    keep_index: int | None,
+    compute_device: torch.device,
+) -> None:
+    """Keep at most one decoder layer on the compute device; park the rest on CPU."""
+    layers = _decoder_layers(model)
+    for index, layer in enumerate(layers):
+        target = compute_device if keep_index is not None and index == keep_index else torch.device("cpu")
+        layer.to(target)
+
+
+def _language_tower(model: nn.Module) -> nn.Module | None:
+    if hasattr(model, "model"):
+        inner = model.model
+        if hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+            return inner.language_model
+        return inner
+    if hasattr(model, "language_model"):
+        return model.language_model
+    return None
+
+
+def _drop_reconstructed_qweights(root: nn.Module) -> None:
+    for module in root.modules():
+        if isinstance(module, HSVQuantLinear) and module._qweight is not None:
+            module._qweight = None
+
+
+def enable_eval_cpu_offload(model: nn.Module, device: torch.device) -> None:
+    """Keep embeddings / norm / lm_head on GPU; page decoder blocks in for each forward.
+
+    Numerically identical to a full-GPU eval: each block runs in the same dtype on
+    ``device``, then its parameters are parked on CPU so peak VRAM is one block plus
+    activations and the language-model head.
+    """
+    if getattr(model, "_eval_cpu_offload", False):
+        return
+    inner = _language_tower(model)
+    if inner is not None:
+        for attr in ("embed_tokens", "rotary_emb", "norm"):
+            module = getattr(inner, attr, None)
+            if isinstance(module, nn.Module):
+                module.to(device)
+    if hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Module):
+        model.lm_head.to(device)
+    layers = _decoder_layers(model)
+    for layer in layers:
+        layer.to("cpu")
+
+        def _pre_hook(mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], compute=device):
+            mod.to(compute)
+            return args, kwargs
+
+        def _post_hook(mod: nn.Module, _args: tuple[Any, ...], output: Any) -> Any:
+            _drop_reconstructed_qweights(mod)
+            mod.to("cpu")
+            return output
+
+        layer.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+        layer.register_forward_hook(_post_hook)
+    model.config.use_cache = False
+    model.eval()
+    model._eval_cpu_offload = True
+    _cuda_empty_cache(device)
+    gc.collect()
+
+
 @torch.no_grad()
 def quantize_qwen_model(
     model: nn.Module,
@@ -2169,6 +2289,8 @@ def quantize_qwen_model(
     hessian_block_size: int,
     max_layers: int = -1,
     seed: int = 0,
+    cpu_offload_layers: bool = False,
+    layer_checkpoint_dir: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
     layers = _decoder_layers(model)
     layer_prefix = _decoder_layer_prefix(model)
@@ -2182,10 +2304,21 @@ def quantize_qwen_model(
         or config.block_input_mode == "reference"
         or config.trajectory_diagnostics
     )
+    if cpu_offload_layers:
+        print(
+            "[H-SVDQuant] cpu_offload_layers=on: only the active decoder block stays on "
+            f"{device}; finished blocks are parked on CPU / optionally snapshotted to disk",
+            flush=True,
+        )
+        _offload_decoder_layers_except(model, keep_index=None, compute_device=device)
+        _cuda_empty_cache(device)
 
     for layer_index in range(layer_count):
         layer = layers[layer_index]
         print(f"[H-SVDQuant] layer {layer_index + 1}/{layer_count}", flush=True)
+        if cpu_offload_layers:
+            _offload_decoder_layers_except(model, keep_index=layer_index, compute_device=device)
+            _cuda_empty_cache(device)
         sequential_groups = _qwen_sequential_groups(layer)
         trajectory_active = (
             config.linear_objective == "cumulative"
@@ -2434,6 +2567,8 @@ def quantize_qwen_model(
                     collectors[name].free()
                     if name in reference_collectors:
                         reference_collectors[name].free()
+                    del hessian, cached_x, module
+                    _cuda_empty_cache(device)
 
         if config.block_input_mode == "quantized":
             next_hidden: list[torch.Tensor] = []
@@ -2498,7 +2633,23 @@ def quantize_qwen_model(
                     states[f"{layer_prefix}.{layer_index}.{name}"][
                         "block_trajectory_diagnostics"
                     ] = block_diagnostics
-        torch.cuda.empty_cache() if device.type == "cuda" else None
+        if layer_checkpoint_dir is not None:
+            layer_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            layer_states = {
+                name: state
+                for name, state in states.items()
+                if name.startswith(f"{layer_prefix}.{layer_index}.")
+            }
+            torch.save(layer_states, layer_checkpoint_dir / f"layer_{layer_index:03d}.pt")
+        if cpu_offload_layers:
+            # Drop rebuilt dense residuals before parking the finished block.
+            for module in layer.modules():
+                if isinstance(module, HSVQuantLinear) and module._qweight is not None:
+                    module._qweight = None
+            layer.to("cpu")
+            _cuda_empty_cache(device)
+        else:
+            _cuda_empty_cache(device)
     return states
 
 
@@ -2521,7 +2672,17 @@ def _make_calibration_batches(
         for _ in range(nsamples):
             samples.append(torch.randint(0, len(tokenizer), (sequence_length,), generator=generator))
     elif dataset_name == "wikitext2":
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        local_root = os.environ.get("HSVDQ_WIKITEXT2_DIR", "")
+        if local_root:
+            from datasets import load_from_disk
+
+            dataset = load_from_disk(local_root)["train"]
+        else:
+            local_parquet = os.environ.get("HSVDQ_WIKITEXT2_TRAIN_PARQUET", "")
+            if local_parquet:
+                dataset = load_dataset("parquet", data_files=local_parquet, split="train")
+            else:
+                dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
         encoded = tokenizer("\n\n".join(dataset["text"]), return_tensors="pt").input_ids[0]
         if encoded.numel() <= sequence_length:
             raise RuntimeError("calibration corpus is shorter than sequence_length")
@@ -2595,6 +2756,8 @@ def load_quant_checkpoint(
     checkpoint_dir: Path,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    cpu_offload_layers: bool = False,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -2621,8 +2784,14 @@ def load_quant_checkpoint(
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu")
     for name, state in states.items():
         _set_submodule(model, name, HSVQuantLinear(state, compute_dtype=dtype))
-    model.to(device).eval()
+    del states
+    gc.collect()
+    model.eval()
     model.config.use_cache = False
+    if cpu_offload_layers:
+        enable_eval_cpu_offload(model, device)
+    else:
+        model.to(device)
     return model, tokenizer, metadata
 
 
@@ -2644,6 +2813,26 @@ def export_dense_model(model: nn.Module, tokenizer: Any, output_dir: Path) -> No
     tokenizer.save_pretrained(output_dir)
 
 
+def _merge_lm_eval_payload(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    for key in (
+        "results",
+        "groups",
+        "group_subtasks",
+        "configs",
+        "versions",
+        "n-samples",
+        "n-shot",
+        "higher_is_better",
+    ):
+        value = src.get(key)
+        if isinstance(value, dict):
+            dst.setdefault(key, {})
+            dst[key].update(value)
+    for key in ("config", "date", "pretty_env_info", "git_hash"):
+        if key in src:
+            dst[key] = src[key]
+
+
 def run_lm_eval(
     model: nn.Module,
     tokenizer: Any,
@@ -2651,19 +2840,195 @@ def run_lm_eval(
     batch_size: int,
     limit: float | None,
     output_path: Path | None,
+    *,
+    device: torch.device | None = None,
+    resume: bool = True,
 ) -> dict[str, Any]:
     from lm_eval import simple_evaluate
     from lm_eval.models.huggingface import HFLM
+    from lm_eval.models.utils import Collator
+    from lm_eval.models.utils_hf import pad_and_concat
+    from tqdm import tqdm
 
-    wrapped = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size, backend="causal")
-    results = simple_evaluate(model=wrapped, tasks=list(tasks), batch_size=batch_size, limit=limit)
+    model.eval()
+    torch.set_grad_enabled(False)
+
+    class LowPeakHFLM(HFLM):
+        """Same loglikelihood as HFLM, but only materializes continuation logits."""
+
+        def _backbone_hidden(self, inps: torch.Tensor) -> torch.Tensor:
+            inner = self.model.model
+            if hasattr(inner, "language_model") and not hasattr(inner, "layers"):
+                inner = inner.language_model
+            return inner(input_ids=inps, use_cache=False).last_hidden_state
+
+        def _output_head(self) -> nn.Module:
+            if hasattr(self.model, "lm_head"):
+                return self.model.lm_head
+            return self.model.get_output_embeddings()
+
+        def _loglikelihood_tokens(
+            self,
+            requests,
+            disable_tqdm: bool = False,
+            override_bs: int | None = None,
+        ):
+            if self.backend != "causal":
+                with torch.no_grad():
+                    return super()._loglikelihood_tokens(
+                        requests, disable_tqdm=disable_tqdm, override_bs=override_bs
+                    )
+            with torch.no_grad():
+                return self._loglikelihood_tokens_impl(
+                    requests, disable_tqdm=disable_tqdm, override_bs=override_bs
+                )
+
+        def _loglikelihood_tokens_impl(
+            self,
+            requests,
+            disable_tqdm: bool = False,
+            override_bs: int | None = None,
+        ):
+            res = []
+
+            def _collate(req):
+                toks = req[1] + req[2]
+                return -len(toks), tuple(toks)
+
+            def _lookup_one_token_cont(req):
+                return req[-2] + req[-1][:-1]
+
+            re_ord = Collator(
+                requests,
+                sort_fn=_collate,
+                group_by="contexts" if self.logits_cache else None,
+                group_fn=_lookup_one_token_cont,
+            )
+            n_reordered_requests = len(re_ord)
+            batch_size_local = (
+                self.batch_size
+                if self.batch_size != "auto"
+                else override_bs
+                if override_bs is not None
+                else 0
+            )
+            batch_fn = (
+                self._batch_scheduler
+                if self.batch_size == "auto" and n_reordered_requests > 0 and not override_bs
+                else None
+            )
+            if batch_fn is not None:
+                self.batch_sizes = {}
+            chunks = re_ord.get_batched(n=batch_size_local, batch_fn=batch_fn)
+            pbar = tqdm(
+                total=len(requests),
+                disable=(disable_tqdm or (self.rank != 0)),
+                desc="Running loglikelihood requests",
+            )
+            lm_head = self._output_head()
+            for chunk in chunks:
+                inps = []
+                cont_toks_list = []
+                inplens = []
+                padding_len_inp = None
+                for _, context_enc, continuation_enc in chunk:
+                    total_length = len(context_enc) + len(continuation_enc)
+                    if total_length > self.max_length + 1:
+                        inp = torch.tensor(
+                            (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                    else:
+                        inp = torch.tensor(
+                            (context_enc + continuation_enc)[:-1],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                    (inplen,) = inp.shape
+                    padding_len_inp = max(padding_len_inp or inplen, inplen)
+                    inps.append(inp)
+                    cont_toks_list.append(continuation_enc)
+                    inplens.append(inplen)
+                batched_inps = pad_and_concat(padding_len_inp, inps, padding_side="right")
+                hidden = self._backbone_hidden(batched_inps)
+                del batched_inps
+                for batch_index, ((request_str, ctx_tokens, _), inplen, cont_toks) in enumerate(
+                    zip(chunk, inplens, cont_toks_list, strict=True)
+                ):
+                    contlen = len(cont_toks)
+                    ctx_len = inplen + (hidden.shape[1] - padding_len_inp)
+                    logits = lm_head(hidden[batch_index, ctx_len - contlen : ctx_len])
+                    logits = F.log_softmax(logits, dim=-1, dtype=self.softmax_dtype).unsqueeze(0)
+                    greedy_tokens = logits.argmax(dim=-1)
+                    for request_str, cont_toks, logits in re_ord.get_cache(
+                        req_str=request_str,
+                        cxt_toks=ctx_tokens,
+                        cont_toks=cont_toks,
+                        logits=logits,
+                    ):
+                        cont_toks = torch.tensor(
+                            cont_toks, dtype=torch.long, device=self.device
+                        ).unsqueeze(0)
+                        max_equal = (greedy_tokens[:, -cont_toks.shape[1] :] == cont_toks).all()
+                        logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)
+                        answer = (float(logits.sum()), bool(max_equal))
+                        res.append(answer)
+                        if request_str is not None:
+                            self.cache_hook.add_partial("loglikelihood", request_str, answer)
+                        pbar.update(1)
+                del hidden
+            pbar.close()
+            return re_ord.get_original(res)
+
+    device_str = str(device) if device is not None else "cuda"
+    wrapped = LowPeakHFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        backend="causal",
+        device=device_str,
+        logits_cache=True,
+    )
+    if device is not None:
+        wrapped._device = device
+    task_list = [task.strip() for task in tasks if task.strip()]
+    merged: dict[str, Any] = {"results": {}}
+    for task in task_list:
+        shard_path = None
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shard_path = output_path.parent / f"{output_path.stem}_{task}.json"
+            if resume and shard_path.exists():
+                print(f"[eval] resume {task} from {shard_path}")
+                _merge_lm_eval_payload(merged, json.loads(shard_path.read_text(encoding="utf-8")))
+                continue
+        print(f"[eval] task={task} batch_size={batch_size}")
+        results = simple_evaluate(
+            model=wrapped,
+            tasks=[task],
+            batch_size=batch_size,
+            limit=limit,
+            log_samples=False,
+        )
+        if shard_path is not None:
+            shard_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+        _merge_lm_eval_payload(merged, results)
+        if device is not None:
+            _cuda_empty_cache(device)
+        gc.collect()
     if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-    return results
+        output_path.write_text(json.dumps(merged, indent=2, default=str), encoding="utf-8")
+    return merged
 
 
-def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+def _load_model(
+    model_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    keep_on_device: bool = True,
+) -> nn.Module:
     from transformers import AutoConfig, AutoModelForCausalLM
 
     model_type = AutoConfig.from_pretrained(model_name).model_type
@@ -2674,9 +3039,35 @@ def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> nn
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
     _decoder_layers(model)
-    model.to(device).eval()
+    # Large models with layer CPU-offload must stay on CPU after load; the first
+    # capture pass stages only embed + layer0 onto the compute device.
+    target = device if keep_on_device else torch.device("cpu")
+    model.to(target).eval()
     model.config.use_cache = False
     return model
+
+
+def _stage_first_layer_for_capture(model: nn.Module, device: torch.device) -> list[nn.Module]:
+    """Move embed (+ optional rotary) and decoder layer0 to ``device``; return moved modules."""
+    moved: list[nn.Module] = []
+    layers = _decoder_layers(model)
+    inner = None
+    if hasattr(model, "model"):
+        inner = model.model
+        if hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+            inner = inner.language_model
+    elif hasattr(model, "language_model"):
+        inner = model.language_model
+    if inner is not None:
+        for attr in ("embed_tokens", "rotary_emb"):
+            if hasattr(inner, attr):
+                module = getattr(inner, attr)
+                if isinstance(module, nn.Module):
+                    module.to(device)
+                    moved.append(module)
+    layers[0].to(device)
+    moved.append(layers[0])
+    return moved
 
 
 def _resolve_ablation_mode(args: argparse.Namespace) -> dict[str, Any]:
@@ -2802,10 +3193,21 @@ def quantize_command(args: argparse.Namespace) -> None:
         args.calib_batch_size,
         args.seed,
     )
-    model = _load_model(args.model, device, dtype)
-    hidden, kwargs = capture_first_layer_inputs(model, batches, device)
+    model = _load_model(
+        args.model,
+        device,
+        dtype,
+        keep_on_device=not args.cpu_offload_layers,
+    )
+    hidden, kwargs = capture_first_layer_inputs(
+        model,
+        batches,
+        device,
+        stage_minimal=args.cpu_offload_layers,
+    )
     del batches
     model_kind = _model_kind(model)
+    layer_ckpt = Path(args.output) / "layer_checkpoints" if args.layer_checkpoints else None
     states = quantize_qwen_model(
         model,
         hidden,
@@ -2816,7 +3218,13 @@ def quantize_command(args: argparse.Namespace) -> None:
         args.hessian_block_size,
         args.max_layers,
         args.seed,
+        cpu_offload_layers=args.cpu_offload_layers,
+        layer_checkpoint_dir=layer_ckpt,
     )
+    if args.cpu_offload_layers:
+        if args.eval_tasks:
+            enable_eval_cpu_offload(model, device)
+        _cuda_empty_cache(device)
     save_quant_checkpoint(Path(args.output), args.model, tokenizer, states, config, args, model_kind)
 
     if args.eval_tasks:
@@ -2827,6 +3235,7 @@ def quantize_command(args: argparse.Namespace) -> None:
             args.eval_batch_size,
             args.eval_limit,
             Path(args.output) / "lm_eval_results.json",
+            device=device,
         )
         print(json.dumps(results.get("results", {}), indent=2, default=str))
     if args.export_dense:
@@ -2836,7 +3245,12 @@ def quantize_command(args: argparse.Namespace) -> None:
 def eval_command(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = _dtype_from_name(args.dtype)
-    model, tokenizer, _ = load_quant_checkpoint(Path(args.checkpoint), device, dtype)
+    model, tokenizer, _ = load_quant_checkpoint(
+        Path(args.checkpoint),
+        device,
+        dtype,
+        cpu_offload_layers=args.cpu_offload_layers,
+    )
     results = run_lm_eval(
         model,
         tokenizer,
@@ -2844,6 +3258,8 @@ def eval_command(args: argparse.Namespace) -> None:
         args.batch_size,
         args.limit,
         None if not args.output else Path(args.output),
+        device=device,
+        resume=not args.no_resume,
     )
     print(json.dumps(results.get("results", {}), indent=2, default=str))
 
@@ -3052,6 +3468,16 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument("--hessian-block-size", type=int, default=4096)
     quantize.add_argument("--seed", type=int, default=0)
     quantize.add_argument("--max-layers", type=int, default=-1)
+    quantize.add_argument(
+        "--cpu-offload-layers",
+        action="store_true",
+        help="keep only the active decoder block on GPU; park finished blocks on CPU to cut peak VRAM",
+    )
+    quantize.add_argument(
+        "--layer-checkpoints",
+        action="store_true",
+        help="snapshot each finished decoder block's quantized state under output/layer_checkpoints/",
+    )
     quantize.add_argument("--bits", type=int, default=4)
     quantize.add_argument("--activation-bits", type=int, default=4)
     quantize.add_argument(
@@ -3252,9 +3678,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--tasks", default="hellaswag,arc_easy")
     evaluate.add_argument("--device", default="cuda:0")
     evaluate.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
-    evaluate.add_argument("--batch-size", type=int, default=4)
+    evaluate.add_argument("--batch-size", type=int, default=1)
     evaluate.add_argument("--limit", type=float, default=None)
     evaluate.add_argument("--output", default="")
+    evaluate.add_argument(
+        "--cpu-offload-layers",
+        action="store_true",
+        default=False,
+        help="page decoder blocks through GPU during eval (lower peak, slower)",
+    )
+    evaluate.add_argument(
+        "--no-cpu-offload-layers",
+        action="store_false",
+        dest="cpu_offload_layers",
+    )
+    evaluate.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="recompute per-task shards even if output_task.json already exists",
+    )
     evaluate.set_defaults(func=eval_command)
 
     self_test = subparsers.add_parser("self-test", help="run a dependency-light numerical smoke test")

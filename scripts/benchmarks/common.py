@@ -33,6 +33,7 @@ from hsvdquant import (  # noqa: E402
     _quantize_activation,
     _set_submodule,
     capture_first_layer_inputs,
+    enable_eval_cpu_offload,
     load_quant_checkpoint,
 )
 
@@ -120,7 +121,19 @@ def get_eval_input_ids(
     from datasets import load_dataset
 
     if dataset_name == "wikitext2":
-        data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        local_root = os.environ.get("HSVDQ_WIKITEXT2_DIR", "")
+        if local_root:
+            from datasets import load_from_disk
+
+            data = load_from_disk(local_root)["test"]
+        else:
+            local_parquet = os.environ.get("HSVDQ_WIKITEXT2_TEST_PARQUET", "")
+            if local_parquet:
+                from datasets import load_dataset
+
+                data = load_dataset("parquet", data_files=local_parquet, split="train")
+            else:
+                data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         encoded = tokenizer("\n\n".join(data["text"]), return_tensors="pt").input_ids
     elif dataset_name == "c4":
         local_c4 = os.environ.get("HSVDQ_C4_VALIDATION", "")
@@ -160,17 +173,22 @@ def compute_ppl(
     nsamples = input_ids.numel() // seqlen
     if max_samples is not None:
         nsamples = min(nsamples, max_samples)
-    loss_fct = nn.CrossEntropyLoss()
     nlls: list[torch.Tensor] = []
     started = time.perf_counter()
+    logit_chunk = 256
     for index in range(nsamples):
         batch = input_ids[:, index * seqlen : (index + 1) * seqlen].to(device)
         outputs = model(batch)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        shift_logits = logits[:, :-1, :].contiguous().float()
+        shift_logits = logits[:, :-1, :]
         shift_labels = batch[:, 1:]
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-        nlls.append(loss * (seqlen - 1))
+        nll = shift_logits.new_zeros(())
+        for start in range(0, shift_logits.size(1), logit_chunk):
+            chunk_logits = shift_logits[:, start : start + logit_chunk].reshape(-1, shift_logits.size(-1)).float()
+            chunk_labels = shift_labels[:, start : start + logit_chunk].reshape(-1)
+            nll = nll + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
+        nlls.append(nll)
+        del outputs, logits, shift_logits
     denom = nsamples * (seqlen - 1)
     ppl = torch.exp(torch.stack(nlls).sum() / denom).item()
     model.config.use_cache = use_cache
@@ -188,17 +206,25 @@ def load_experiment_model(
     checkpoint: str | None,
     device: torch.device,
     dtype: torch.dtype,
+    cpu_offload_layers: bool = False,
 ) -> tuple[nn.Module, Any, RuntimeConfig]:
     if checkpoint is None:
-        model = _load_model(model_name, device, dtype)
+        model = _load_model(model_name, device, dtype, keep_on_device=not cpu_offload_layers)
         tokenizer = make_tokenizer(model_name)
+        if cpu_offload_layers:
+            enable_eval_cpu_offload(model, device)
         return model, tokenizer, RuntimeConfig("fp", "fp", model_name, None, str(dtype), str(device))
 
     checkpoint_dir = Path(checkpoint)
     hsvd_config = checkpoint_dir / "hsvdquant_config.json"
     dense_config = checkpoint_dir / "baseline_quant_config.json"
     if hsvd_config.exists():
-        model, tokenizer, meta = load_quant_checkpoint(checkpoint_dir, device, dtype)
+        model, tokenizer, meta = load_quant_checkpoint(
+            checkpoint_dir,
+            device,
+            dtype,
+            cpu_offload_layers=cpu_offload_layers,
+        )
         method = meta.get("method", "hsvdquant")
         return model, tokenizer, RuntimeConfig("hsvdquant", method, meta["base_model"], checkpoint, str(dtype), str(device))
     if dense_config.exists():

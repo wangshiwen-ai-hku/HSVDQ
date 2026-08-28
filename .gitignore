@@ -1,6 +1,7 @@
 .toy-venv/
 __pycache__/
 .venv/
+.cache
 outputs/
 *.pyc
 models/*
