@@ -209,7 +209,6 @@ def load_experiment_model(
     dtype: torch.dtype,
     cpu_offload_layers: bool = False,
     runtime_backend: str = "eager",
-    allow_activation_group_remap: bool = False,
 ) -> tuple[nn.Module, Any, RuntimeConfig]:
     if checkpoint is None:
         model = _load_model(model_name, device, dtype, keep_on_device=not cpu_offload_layers)
@@ -230,7 +229,6 @@ def load_experiment_model(
             dtype,
             cpu_offload_layers=cpu_offload_layers,
             runtime_backend=runtime_backend,
-            allow_activation_group_remap=allow_activation_group_remap,
         )
         method = meta.get("method", "hsvdquant")
         return model, tokenizer, RuntimeConfig(

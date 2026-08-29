@@ -60,8 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
-    parser.add_argument("--runtime-backend", choices=["eager", "nunchaku"], default="eager")
-    parser.add_argument("--allow-activation-group-remap", action="store_true")
+    parser.add_argument("--runtime-backend", choices=["eager", "hsvdq_cuda"], default="eager")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)
     return parser
@@ -79,7 +78,6 @@ def main() -> None:
         device=device,
         dtype=dtype,
         runtime_backend=args.runtime_backend,
-        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     vocab = len(tokenizer)
     input_ids = torch.randint(0, vocab, (args.batch_size, args.prompt_len), device=device)

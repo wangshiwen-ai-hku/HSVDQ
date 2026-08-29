@@ -7,16 +7,12 @@ OUTPUT=${OUTPUT:-outputs/qwen3-8b-v2-r4w4a4/int4-smoke}
 DEVICE=${DEVICE:-cuda:0}
 DTYPE=${DTYPE:-float16}
 PYTHON_BIN=${PYTHON_BIN:-python}
-ALLOW_ACTIVATION_GROUP_REMAP=${ALLOW_ACTIVATION_GROUP_REMAP:-1}
-
-RUNTIME_ARGS=(--runtime-backend nunchaku)
-if [[ "${ALLOW_ACTIVATION_GROUP_REMAP}" == "1" ]]; then
-  RUNTIME_ARGS+=(--allow-activation-group-remap)
-fi
+RUNTIME_ARGS=(--runtime-backend hsvdq_cuda)
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 mkdir -p "${OUTPUT}"
 
-"${PYTHON_BIN}" scripts/benchmarks/verify_int4_runtime.py \
+"${PYTHON_BIN}" scripts/benchmarks/verify_hsvdq_cuda_runtime.py \
   --dtype "${DTYPE}" \
   --require-cuda
 

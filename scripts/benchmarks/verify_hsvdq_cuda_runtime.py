@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate packed H-SVDQuant state on CPU and Nunchaku numerics on CUDA."""
+"""Validate native H-SVDQuant packing on CPU and W4A4 numerics on CUDA."""
 
 from __future__ import annotations
 
@@ -16,15 +16,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hsvdquant import HSVQuantLinear  # noqa: E402
-from hsvdquant_int4 import (  # noqa: E402
-    NunchakuHSVQuantLinear,
-    pack_nunchaku_lowrank,
-    pack_nunchaku_scales,
-    pack_nunchaku_weight,
-    prepare_nunchaku_state,
-    unpack_nunchaku_lowrank,
-    unpack_nunchaku_scales,
-    unpack_nunchaku_weight,
+from hsvdquant_cuda import (  # noqa: E402
+    HSVDCudaLinear,
+    PackedQuantSpec,
+    pack_signed_codes,
+    prepare_hsvdq_cuda_state,
+    resolve_kernel,
+    unpack_signed_codes,
 )
 
 
@@ -56,78 +54,70 @@ def make_state(
 
 
 def cpu_checks() -> dict[str, Any]:
+    generator = torch.Generator().manual_seed(3)
+    roundtrips: dict[str, list[int]] = {}
+    for bits in (2, 4, 8):
+        qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        codes = torch.randint(qmin, qmax + 1, (7, 256), generator=generator, dtype=torch.int8)
+        packed = pack_signed_codes(codes, bits)
+        torch.testing.assert_close(unpack_signed_codes(packed, bits), codes, rtol=0, atol=0)
+        roundtrips[f"int{bits}"] = list(packed.shape)
+
     state = make_state()
-    codes = state["codes"]
-    packed_weight = pack_nunchaku_weight(codes)
-    torch.testing.assert_close(unpack_nunchaku_weight(packed_weight, codes.shape[1]), codes, rtol=0, atol=0)
-
-    scales_g64 = state["scales"].repeat_interleave(2, dim=1)
-    packed_scales = pack_nunchaku_scales(scales_g64)
-    torch.testing.assert_close(unpack_nunchaku_scales(packed_scales), scales_g64, rtol=0, atol=0)
-
-    down = torch.zeros(16, state["in_features"], dtype=torch.float16)
-    down[:4] = (state["l1"] / state["d"][:, None]).T
-    up = torch.zeros(state["out_features"], 16, dtype=torch.float16)
-    up[:, :4] = state["l2"].T
+    packed = prepare_hsvdq_cuda_state(state, torch.float16)
     torch.testing.assert_close(
-        unpack_nunchaku_lowrank(pack_nunchaku_lowrank(down, down=True), down=True),
-        down,
-        rtol=0,
-        atol=0,
+        unpack_signed_codes(packed["qweight"], 4), state["codes"], rtol=0, atol=0
     )
-    torch.testing.assert_close(
-        unpack_nunchaku_lowrank(pack_nunchaku_lowrank(up, down=False), down=False),
-        up,
-        rtol=0,
-        atol=0,
-    )
+    assert packed["spec"].activation_group_size == 128
+    assert packed["spec"].rank == 4
+    assert packed["kernel_name"] == "w4a4_g128_wmma_sm75_89"
 
-    packed = prepare_nunchaku_state(
-        state,
-        torch.float16,
-        allow_activation_group_remap=True,
-    )
-    torch.testing.assert_close(
-        unpack_nunchaku_weight(packed["qweight"], state["in_features"]),
-        state["codes"],
-        rtol=0,
-        atol=0,
-    )
-    packed_bytes = sum(
+    try:
+        resolve_kernel(PackedQuantSpec(4, 8, 128, 128, 4))
+    except ValueError as error:
+        assert "no native kernel registered" in str(error)
+    else:
+        raise AssertionError("unsupported W4A8 spec did not fail explicitly")
+
+    tensor_bytes = sum(
         value.numel() * value.element_size() for value in packed.values() if torch.is_tensor(value)
     )
     dense_residual_bytes = state["in_features"] * state["out_features"] * 2
     return {
         "status": "ok",
-        "packed_weight_shape": list(packed["qweight"].shape),
-        "logical_rank": packed["logical_rank"],
-        "physical_rank": packed["physical_rank"],
-        "packed_state_bytes": packed_bytes,
+        "roundtrip_shapes": roundtrips,
+        "kernel": packed["kernel_name"],
+        "packed_state_bytes": tensor_bytes,
         "dense_residual_bytes": dense_residual_bytes,
-        "packed_to_dense_residual_ratio": packed_bytes / dense_residual_bytes,
+        "packed_to_dense_residual_ratio": tensor_bytes / dense_residual_bytes,
     }
 
 
 @torch.no_grad()
 def cuda_checks(dtype: torch.dtype) -> dict[str, Any]:
-    state = make_state(group_size=64, activation_group_size=64, dtype=dtype)
+    state = make_state(dtype=dtype)
     eager = HSVQuantLinear(state, compute_dtype=dtype).to("cuda").eval()
-    packed_state = prepare_nunchaku_state(state, dtype)
-    packed = NunchakuHSVQuantLinear(packed_state, dtype).to("cuda").eval()
-    inputs = torch.randn(2, 11, state["in_features"], device="cuda", dtype=dtype)
-    reference = eager(inputs)
-    actual = packed(inputs)
-    torch.cuda.synchronize()
-    error = (actual.float() - reference.float()).abs()
-    relative_l2 = float(error.norm() / reference.float().norm().clamp_min(1e-8))
-    if relative_l2 > 0.03:
-        raise AssertionError(f"Nunchaku relative L2 error is too high: {relative_l2:.6f}")
+    native = HSVDCudaLinear.from_state(state, dtype).to("cuda").eval()
+    cases = {}
+    for rows in (1, 17, 22):
+        inputs = torch.randn(rows, state["in_features"], device="cuda", dtype=dtype)
+        reference = eager(inputs)
+        actual = native(inputs)
+        torch.cuda.synchronize()
+        error = (actual.float() - reference.float()).abs()
+        relative_l2 = float(error.norm() / reference.float().norm().clamp_min(1e-8))
+        if relative_l2 > 0.035:
+            raise AssertionError(f"rows={rows}: native relative L2 error is too high: {relative_l2:.6f}")
+        cases[str(rows)] = {
+            "max_abs_error": float(error.max()),
+            "relative_l2_error": relative_l2,
+        }
     return {
         "status": "ok",
         "dtype": str(dtype),
-        "max_abs_error": float(error.max()),
-        "relative_l2_error": relative_l2,
         "gpu": torch.cuda.get_device_name(),
+        "compute_capability": list(torch.cuda.get_device_capability()),
+        "cases": cases,
     }
 
 

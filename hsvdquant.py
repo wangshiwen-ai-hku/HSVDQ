@@ -12,8 +12,8 @@ calibration batches before any weight is quantized.  Raw activation rows are
 kept only in a bounded priority reservoir for the dynamic-activation D block.
 
 The eager reference backend stores integer codes as int8 and reconstructs the
-dequantized residual.  The optional Nunchaku backend packs W4 weights and runs
-the residual plus low-rank branch with true W4A4 CUDA tensor-core kernels.
+dequantized residual.  The native hsvdq_cuda backend keeps W4 weights packed
+and runs the residual plus low-rank branch with true W4A4 CUDA tensor cores.
 """
 
 from __future__ import annotations
@@ -2760,14 +2760,13 @@ def load_quant_checkpoint(
     *,
     cpu_offload_layers: bool = False,
     runtime_backend: str = "eager",
-    allow_activation_group_remap: bool = False,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    if runtime_backend not in {"eager", "nunchaku"}:
+    if runtime_backend not in {"eager", "hsvdq_cuda"}:
         raise ValueError(f"unsupported runtime backend: {runtime_backend}")
-    if runtime_backend == "nunchaku" and dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("Nunchaku runtime requires float16 or bfloat16")
+    if runtime_backend == "hsvdq_cuda" and dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("hsvdq_cuda runtime requires float16 or bfloat16")
     metadata = json.loads((checkpoint_dir / "hsvdquant_config.json").read_text(encoding="utf-8"))
     model_kind = metadata.get("model_kind", "")
     if not model_kind:
@@ -2789,19 +2788,12 @@ def load_quant_checkpoint(
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu", weights_only=True)
     except TypeError:
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu")
-    if runtime_backend == "nunchaku":
-        from hsvdquant_int4 import build_nunchaku_linear
+    if runtime_backend == "hsvdq_cuda":
+        from hsvdquant_cuda import build_hsvdq_cuda_linear
 
-    activation_group_remapped = False
     for name, state in states.items():
-        if runtime_backend == "nunchaku":
-            source_activation_group = int(state.get("activation_group_size", 0))
-            activation_group_remapped |= source_activation_group != 64
-            replacement = build_nunchaku_linear(
-                state,
-                dtype,
-                allow_activation_group_remap=allow_activation_group_remap,
-            )
+        if runtime_backend == "hsvdq_cuda":
+            replacement = build_hsvdq_cuda_linear(state, dtype)
         else:
             replacement = HSVQuantLinear(state, compute_dtype=dtype)
         _set_submodule(model, name, replacement)
@@ -2810,7 +2802,6 @@ def load_quant_checkpoint(
     model.eval()
     model.config.use_cache = False
     metadata["runtime_backend"] = runtime_backend
-    metadata["activation_group_remap"] = activation_group_remapped
     if cpu_offload_layers:
         enable_eval_cpu_offload(model, device)
     else:
@@ -3274,7 +3265,6 @@ def eval_command(args: argparse.Namespace) -> None:
         dtype,
         cpu_offload_layers=args.cpu_offload_layers,
         runtime_backend=args.runtime_backend,
-        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     results = run_lm_eval(
         model,
@@ -3708,14 +3698,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", default="")
     evaluate.add_argument(
         "--runtime-backend",
-        choices=["eager", "nunchaku"],
+        choices=["eager", "hsvdq_cuda"],
         default="eager",
-        help="eager reference path or packed Nunchaku W4A4 CUDA kernels",
-    )
-    evaluate.add_argument(
-        "--allow-activation-group-remap",
-        action="store_true",
-        help="explicitly run non-g64 checkpoints with Nunchaku's A-group 64 quantizer",
+        help="eager reference path or native packed H-SVDQuant CUDA kernels",
     )
     evaluate.add_argument(
         "--cpu-offload-layers",
