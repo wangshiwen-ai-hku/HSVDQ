@@ -72,6 +72,27 @@ def cpu_checks() -> dict[str, Any]:
     assert packed["spec"].rank == 4
     assert packed["kernel_name"] == "w4a4_g128_wmma_sm75_89"
 
+    permuted_state = dict(state)
+    permuted_state["activation_permutation"] = torch.arange(
+        state["in_features"] - 1, -1, -1
+    )
+    try:
+        prepare_hsvdq_cuda_state(permuted_state, torch.float16)
+    except ValueError as error:
+        assert "does not yet fuse V3 activation permutations" in str(error)
+    else:
+        raise AssertionError("native packing silently accepted an unsupported V3 permutation")
+
+    hadamard_state = dict(state)
+    hadamard_state["activation_hadamard_group_size"] = 128
+    hadamard_state["activation_hadamard_signs"] = torch.ones(state["in_features"])
+    try:
+        prepare_hsvdq_cuda_state(hadamard_state, torch.float16)
+    except ValueError as error:
+        assert "does not yet fuse V3 block Hadamard transforms" in str(error)
+    else:
+        raise AssertionError("native packing silently accepted an unsupported block Hadamard")
+
     try:
         resolve_kernel(PackedQuantSpec(4, 8, 128, 128, 4))
     except ValueError as error:

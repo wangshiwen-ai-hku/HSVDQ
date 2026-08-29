@@ -26,6 +26,26 @@ The initial GEMM is a correctness-oriented 8x8x32 sub-byte WMMA kernel. Its
 packed state and dispatch key are stable; a later 16x8x64 pipelined kernel can
 replace it without changing checkpoint files or model loading.
 
+### Experimental V3 activation transforms
+
+The eager `HSVQuantLinear` runtime accepts an optional static
+`activation_permutation` in a layer state. It applies the permutation only to
+the activation/residual path; `L1/L2` remain in the original smoothed input
+coordinates. `dense_weight()` maps the quantized residual back before folding.
+
+It also accepts `activation_hadamard_group_size` plus optional
+`activation_hadamard_signs`. The eager path applies a normalized randomized
+block transform `R = D H` before activation quantization; residual codes are
+stored in the matching `R^T W` coordinates. `dense_weight()` inverts both the
+Hadamard and permutation transforms.
+
+The native kernel intentionally rejects either transform for now. Arbitrary
+index loads would invalidate its contiguous/coalesced K path, while Hadamard
+requires a fused FWHT before A4 packing. Native support must fold the
+permutation into the producer layout or fuse an admitted gather and transform.
+It must not silently run a numerically different layout. The eager toy
+experiment is the admission test before that kernel work.
+
 ## WxAx extension
 
 `PackedQuantSpec` and canonical signed 2/4/8-bit packing are independent of
@@ -64,6 +84,16 @@ CPU-only format and dispatch checks:
 ```bash
 python scripts/benchmarks/verify_hsvdq_cuda_runtime.py
 ```
+
+V3-OAR local theory and activation-tail toy:
+
+```bash
+python scripts/benchmarks/verify_v3_outlier_routing.py
+python scripts/benchmarks/toy_v3_outlier_routing.py
+```
+
+The toy writes its held-out ablation to
+`hsvdquant/toy/results/v3_outlier_routing/`.
 
 On the 4090, the first run JIT-compiles the local extension, then compares
 native CUDA output with the eager operator, records full-GPU memory and

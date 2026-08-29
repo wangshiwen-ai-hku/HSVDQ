@@ -147,6 +147,14 @@ def prepare_hsvdq_cuda_state(state: dict[str, Any], compute_dtype: torch.dtype) 
     """Convert one checkpoint layer to the backend's packed, device-agnostic state."""
     _require(compute_dtype in (torch.float16, torch.bfloat16), "hsvdq_cuda requires float16 or bfloat16")
     _require(not _has_runtime_correction(state), "hsvdq_cuda does not yet fuse runtime correction modules")
+    _require(
+        state.get("activation_permutation") is None,
+        "hsvdq_cuda does not yet fuse V3 activation permutations; use the eager runtime",
+    )
+    _require(
+        not int(state.get("activation_hadamard_group_size", 0)),
+        "hsvdq_cuda does not yet fuse V3 block Hadamard transforms; use the eager runtime",
+    )
 
     in_features = int(state["in_features"])
     out_features = int(state["out_features"])

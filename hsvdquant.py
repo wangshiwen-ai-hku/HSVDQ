@@ -182,6 +182,54 @@ def _geometric_normalize(values: torch.Tensor, clip: float) -> torch.Tensor:
     return log_values.exp()
 
 
+def _block_hadamard_last_dim(
+    inputs: torch.Tensor,
+    group_size: int,
+    signs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply normalized block R = D H on the last dimension."""
+
+    if group_size <= 0 or group_size & (group_size - 1):
+        raise ValueError("activation_hadamard_group_size must be a positive power of two")
+    channels = inputs.shape[-1]
+    if channels % group_size:
+        raise ValueError("in_features must be divisible by activation_hadamard_group_size")
+    original_shape = inputs.shape
+    transformed = inputs
+    if signs is not None:
+        transformed = transformed * signs.to(
+            device=inputs.device, dtype=inputs.dtype
+        )
+    transformed = transformed.reshape(-1, channels // group_size, group_size)
+    width = 1
+    while width < group_size:
+        blocks = transformed.reshape(
+            *transformed.shape[:-1], group_size // (2 * width), 2, width
+        )
+        left = blocks[..., 0, :]
+        right = blocks[..., 1, :]
+        transformed = torch.cat((left + right, left - right), dim=-1).reshape(
+            *transformed.shape[:-1], group_size
+        )
+        width *= 2
+    return transformed.reshape(original_shape) / math.sqrt(group_size)
+
+
+def _inverse_block_hadamard_weight(
+    transformed_weight: torch.Tensor,
+    group_size: int,
+    signs: torch.Tensor | None,
+) -> torch.Tensor:
+    """Recover W from transformed R^T W, where R = D H."""
+
+    weight = _block_hadamard_last_dim(transformed_weight.T, group_size).T
+    if signs is not None:
+        weight = weight * signs.to(
+            device=weight.device, dtype=weight.dtype
+        )[:, None]
+    return weight
+
+
 def _hessian_deflate(hessian: torch.Tensor, basis: torch.Tensor | None, damp: float = 1e-6) -> torch.Tensor:
     if basis is None or basis.numel() == 0:
         return _sym(hessian)
@@ -1279,11 +1327,31 @@ def _state_error(
     activation_bits: int,
     activation_group_size: int = 0,
     target_outputs: torch.Tensor | None = None,
+    activation_permutation: torch.Tensor | None = None,
+    activation_hadamard_group_size: int = 0,
+    activation_hadamard_signs: torch.Tensor | None = None,
 ) -> float:
     if cached_x is not None:
         x = cached_x.to(device=original_weight.device, dtype=torch.float32)
         smoothed = x / d
-        prediction = _quantize_activation(smoothed, activation_bits, activation_group_size) @ quantized_residual
+        quantizer_input = (
+            smoothed
+            if activation_permutation is None
+            else smoothed.index_select(
+                -1,
+                activation_permutation.to(device=smoothed.device, dtype=torch.long),
+            )
+        )
+        if activation_hadamard_group_size:
+            quantizer_input = _block_hadamard_last_dim(
+                quantizer_input,
+                activation_hadamard_group_size,
+                activation_hadamard_signs,
+            )
+        prediction = (
+            _quantize_activation(quantizer_input, activation_bits, activation_group_size)
+            @ quantized_residual
+        )
         if l1.shape[1]:
             prediction = prediction + (smoothed @ l1) @ l2
         target = (
@@ -1292,7 +1360,22 @@ def _state_error(
             else target_outputs.to(device=original_weight.device, dtype=torch.float32)
         )
         return float((prediction - target).square().mean().item())
-    effective = (l1 @ l2 + quantized_residual) / d[:, None]
+    residual = quantized_residual
+    if activation_hadamard_group_size:
+        residual = _inverse_block_hadamard_weight(
+            residual,
+            activation_hadamard_group_size,
+            activation_hadamard_signs,
+        )
+    if activation_permutation is not None:
+        physical_residual = torch.empty_like(residual)
+        physical_residual.index_copy_(
+            0,
+            activation_permutation.to(device=residual.device, dtype=torch.long),
+            residual,
+        )
+        residual = physical_residual
+    effective = (l1 @ l2 + residual) / d[:, None]
     error = original_weight - effective
     return float(((hessian @ error) * error).sum().div(error.shape[1]).item())
 
@@ -1896,12 +1979,49 @@ class HSVQuantLinear(nn.Module):
         self.bits = int(state["bits"])
         self.activation_bits = int(state["activation_bits"])
         self.activation_group_size = int(state.get("activation_group_size", 0))
+        self.activation_hadamard_group_size = int(
+            state.get("activation_hadamard_group_size", 0)
+        )
         dtype = compute_dtype or state["l1"].dtype
         self.register_buffer("d", state["d"].to(dtype=dtype))
         self.register_buffer("l1", state["l1"].to(dtype=dtype))
         self.register_buffer("l2", state["l2"].to(dtype=dtype))
         self.register_buffer("codes", state["codes"].to(torch.int8))
         self.register_buffer("scales", state["scales"].to(dtype=dtype))
+        permutation = state.get("activation_permutation")
+        if permutation is not None:
+            permutation = permutation.to(dtype=torch.long).reshape(-1)
+            if permutation.numel() != self.in_features:
+                raise ValueError("activation_permutation length must equal in_features")
+            if torch.unique(permutation).numel() != self.in_features:
+                raise ValueError("activation_permutation must contain every input channel exactly once")
+            if int(permutation.min()) != 0 or int(permutation.max()) != self.in_features - 1:
+                raise ValueError("activation_permutation indices must be in [0, in_features)")
+        self.register_buffer("activation_permutation", permutation)
+        hadamard_signs = state.get("activation_hadamard_signs")
+        if self.activation_hadamard_group_size:
+            if (
+                self.activation_hadamard_group_size <= 0
+                or self.activation_hadamard_group_size
+                & (self.activation_hadamard_group_size - 1)
+            ):
+                raise ValueError("activation_hadamard_group_size must be a power of two")
+            if self.in_features % self.activation_hadamard_group_size:
+                raise ValueError(
+                    "in_features must be divisible by activation_hadamard_group_size"
+                )
+            if hadamard_signs is None:
+                hadamard_signs = torch.ones(self.in_features)
+            hadamard_signs = hadamard_signs.to(dtype=dtype).reshape(-1)
+            if hadamard_signs.numel() != self.in_features:
+                raise ValueError("activation_hadamard_signs length must equal in_features")
+            if not torch.all(hadamard_signs.abs() == 1):
+                raise ValueError("activation_hadamard_signs must contain only -1 or +1")
+        elif hadamard_signs is not None:
+            raise ValueError(
+                "activation_hadamard_signs requires activation_hadamard_group_size"
+            )
+        self.register_buffer("activation_hadamard_signs", hadamard_signs)
         bias = state.get("bias")
         self.register_buffer("bias", None if bias is None else bias.to(dtype=dtype))
         # Dense residual is rebuilt per forward and discarded. Caching it on every
@@ -1920,6 +2040,13 @@ class HSVQuantLinear(nn.Module):
         generic = correction.get("generic") if isinstance(correction.get("generic"), dict) else {}
         generic_left = correction.get("generic_left", generic.get("left", None))
         generic_right = correction.get("generic_right", generic.get("right", None))
+        if (permutation is not None or self.activation_hadamard_group_size) and any(
+            value is not None
+            for value in (dc, lut, sparse_threshold, generic_left, generic_right)
+        ):
+            raise ValueError(
+                "V3 activation transforms are not compatible with legacy runtime corrections"
+            )
         if (generic_left is None) != (generic_right is None):
             raise ValueError("generic correction requires both left and right factors")
         self.register_buffer("correction_dc", None if dc is None else dc.to(dtype=dtype))
@@ -1952,8 +2079,19 @@ class HSVQuantLinear(nn.Module):
                 self._qweight = qweight
         d = self.d.to(dtype=inputs.dtype)
         smoothed = inputs / d
+        quantizer_input = (
+            smoothed
+            if self.activation_permutation is None
+            else smoothed.index_select(-1, self.activation_permutation)
+        )
+        if self.activation_hadamard_group_size:
+            quantizer_input = _block_hadamard_last_dim(
+                quantizer_input,
+                self.activation_hadamard_group_size,
+                self.activation_hadamard_signs,
+            )
         quantized_inputs, activation_codes, _activation_scales = _quantize_activation_with_codes(
-            smoothed,
+            quantizer_input,
             self.activation_bits,
             self.activation_group_size,
         )
@@ -1993,6 +2131,16 @@ class HSVQuantLinear(nn.Module):
     @torch.no_grad()
     def dense_weight(self) -> torch.Tensor:
         residual = self._build_qweight(torch.float32).T
+        if self.activation_hadamard_group_size:
+            residual = _inverse_block_hadamard_weight(
+                residual,
+                self.activation_hadamard_group_size,
+                self.activation_hadamard_signs,
+            )
+        if self.activation_permutation is not None:
+            physical_residual = torch.empty_like(residual)
+            physical_residual.index_copy_(0, self.activation_permutation, residual)
+            residual = physical_residual
         branch = self.l1.float() @ self.l2.float()
         return ((residual + branch) / self.d.float()[:, None]).T.contiguous()
 
@@ -2088,6 +2236,9 @@ def _state_error_from_state(
         int(state["activation_bits"]),
         int(state.get("activation_group_size", 0)),
         target_outputs,
+        state.get("activation_permutation"),
+        int(state.get("activation_hadamard_group_size", 0)),
+        state.get("activation_hadamard_signs"),
     )
 
 
@@ -3325,6 +3476,67 @@ def self_test_command(_args: argparse.Namespace) -> None:
     output = quantized(x)
     assert output.shape == (96, out_features)
     assert torch.isfinite(output).all()
+    # Eager V3 runtime: reorder only the activation/residual path.  The test
+    # permutation crosses A groups while staying inside each W group, so the
+    # existing weight scales remain valid after reordering code columns.
+    local = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7])
+    permutation = torch.cat((local, local + 8))
+    permuted_state = dict(state)
+    permuted_state["activation_permutation"] = permutation
+    permuted_state["codes"] = state["codes"].index_select(1, permutation)
+    permuted = HSVQuantLinear(permuted_state, compute_dtype=torch.float32)
+    smoothed = x / permuted.d
+    quantizer_input = smoothed.index_select(1, permutation)
+    manual_qinput = _quantize_activation(
+        quantizer_input,
+        config.activation_bits,
+        config.activation_group_size,
+    )
+    manual_output = F.linear(manual_qinput, permuted._build_qweight(torch.float32), None)
+    manual_output = manual_output + (smoothed @ permuted.l1) @ permuted.l2
+    manual_output = manual_output + permuted.bias
+    assert torch.allclose(permuted(x), manual_output, atol=1e-6, rtol=1e-5)
+    residual_permuted = permuted._build_qweight(torch.float32).T
+    residual_physical = torch.empty_like(residual_permuted)
+    residual_physical.index_copy_(0, permutation, residual_permuted)
+    manual_dense = (
+        (residual_physical + permuted.l1.float() @ permuted.l2.float())
+        / permuted.d.float()[:, None]
+    ).T
+    assert torch.allclose(permuted.dense_weight(), manual_dense, atol=1e-6, rtol=1e-5)
+    hadamard_state = dict(permuted_state)
+    hadamard_state["activation_hadamard_group_size"] = 4
+    hadamard_state["activation_hadamard_signs"] = torch.tensor(
+        [1, -1, 1, 1, -1, 1, -1, 1] * 2,
+        dtype=torch.float32,
+    )
+    hadamard = HSVQuantLinear(hadamard_state, compute_dtype=torch.float32)
+    transformed_input = _block_hadamard_last_dim(
+        quantizer_input,
+        hadamard.activation_hadamard_group_size,
+        hadamard.activation_hadamard_signs,
+    )
+    manual_qinput = _quantize_activation(
+        transformed_input,
+        config.activation_bits,
+        config.activation_group_size,
+    )
+    manual_output = F.linear(manual_qinput, hadamard._build_qweight(torch.float32), None)
+    manual_output = manual_output + (smoothed @ hadamard.l1) @ hadamard.l2
+    manual_output = manual_output + hadamard.bias
+    assert torch.allclose(hadamard(x), manual_output, atol=1e-6, rtol=1e-5)
+    residual_hadamard = _inverse_block_hadamard_weight(
+        hadamard._build_qweight(torch.float32).T,
+        hadamard.activation_hadamard_group_size,
+        hadamard.activation_hadamard_signs,
+    )
+    residual_physical = torch.empty_like(residual_hadamard)
+    residual_physical.index_copy_(0, permutation, residual_hadamard)
+    manual_dense = (
+        (residual_physical + hadamard.l1.float() @ hadamard.l2.float())
+        / hadamard.d.float()[:, None]
+    ).T
+    assert torch.allclose(hadamard.dense_weight(), manual_dense, atol=1e-6, rtol=1e-5)
     correction_state = dict(state)
     correction_groups = math.ceil(in_features / config.activation_group_size)
     correction_levels = 2 * (2 ** (config.activation_bits - 1) - 1) + 1

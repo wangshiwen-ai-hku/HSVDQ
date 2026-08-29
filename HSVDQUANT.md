@@ -103,3 +103,21 @@ weights. It is a portable W4A16 reconstruction for compatibility testing; use
 Calibration keeps `Z` in `int8` for correctness and debuggability. The optional
 `hsvdq_cuda` backend packs those codes to W4 at load time and runs a fused W4A4
 WMMA kernel; see [`INT4_RUNTIME.md`](INT4_RUNTIME.md).
+
+## Experimental V3-OAR
+
+The current V3 proposal is local outlier-aware grouping and FP low-rank
+routing; it does not use the deprecated teacher--student trajectory method.
+The derivation is in
+[`hsvdquant/V3_OUTLIER_ROUTING.md`](hsvdquant/V3_OUTLIER_ROUTING.md).
+Reusable eager calibration blocks live in `v3_outlier_routing.py`, and the
+checkpoint-free activation-tail experiment can be reproduced with:
+
+```bash
+python scripts/benchmarks/toy_v3_outlier_routing.py
+```
+
+Static activation permutations and randomized block Hadamard transforms are
+supported by the eager runtime. The native W4A4 kernel rejects them until
+producer folding/indexed packing and a fused FWHT path are implemented and
+benchmarked.

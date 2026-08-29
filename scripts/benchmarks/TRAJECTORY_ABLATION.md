@@ -1,5 +1,10 @@
 # Teacher--Student Trajectory Ablation
 
+> **Deprecated:** the trajectory-based variant formerly named V3 failed validation and is not
+> part of the current method. Keep this document and its runner only for reproducing the negative
+> result. The new V3 design is the local outlier-aware grouping and FP-routing method documented in
+> `hsvdquant/V3_OUTLIER_ROUTING.md`; it does not use teacher--student trajectory correction.
+
 This experiment isolates the three algorithmic generations while keeping the
 deployed H-SVDQuant operator, rank, weight grouping, calibration budget, seed,
 and activation quantizer fixed.
