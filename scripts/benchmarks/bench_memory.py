@@ -22,7 +22,7 @@ from common import (
 def memory_snapshot(device: torch.device) -> dict[str, float]:
     if device.type != "cuda":
         return {}
-    index = torch.cuda.current_device()
+    index = torch.cuda.current_device() if device.index is None else device.index
     return {
         "allocated_gb": torch.cuda.memory_allocated(index) / 1024**3,
         "reserved_gb": torch.cuda.memory_reserved(index) / 1024**3,
@@ -34,7 +34,7 @@ def memory_snapshot(device: torch.device) -> dict[str, float]:
 def reset_peak(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
-        index = torch.cuda.current_device()
+        index = torch.cuda.current_device() if device.index is None else device.index
         torch.cuda.reset_peak_memory_stats(index)
         torch.cuda.synchronize(index)
 
@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--runtime-backend", choices=["eager", "nunchaku"], default="eager")
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)
     return parser
@@ -68,6 +70,8 @@ def main() -> None:
         checkpoint=args.checkpoint or None,
         device=device,
         dtype=dtype,
+        runtime_backend=args.runtime_backend,
+        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     metrics: dict[str, object] = {"load": memory_snapshot(device)}
     vocab = len(tokenizer)

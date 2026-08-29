@@ -28,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--runtime-backend", choices=["eager", "nunchaku"], default="eager")
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
     parser.add_argument("--output", required=True)
     return parser
 
@@ -41,6 +43,8 @@ def main() -> None:
         checkpoint=args.checkpoint or None,
         device=device,
         dtype=dtype,
+        runtime_backend=args.runtime_backend,
+        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     input_ids = get_eval_input_ids(
         args.dataset,

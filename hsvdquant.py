@@ -11,8 +11,9 @@ paper's [in, out] layout.  Calibration Hessians are accumulated over all
 calibration batches before any weight is quantized.  Raw activation rows are
 kept only in a bounded priority reservoir for the dynamic-activation D block.
 
-This is a research implementation.  Integer codes are stored compactly as int8
-(not bit-packed); inference reconstructs the dequantized residual on device.
+The eager reference backend stores integer codes as int8 and reconstructs the
+dequantized residual.  The optional Nunchaku backend packs W4 weights and runs
+the residual plus low-rank branch with true W4A4 CUDA tensor-core kernels.
 """
 
 from __future__ import annotations
@@ -2758,9 +2759,15 @@ def load_quant_checkpoint(
     dtype: torch.dtype,
     *,
     cpu_offload_layers: bool = False,
+    runtime_backend: str = "eager",
+    allow_activation_group_remap: bool = False,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+    if runtime_backend not in {"eager", "nunchaku"}:
+        raise ValueError(f"unsupported runtime backend: {runtime_backend}")
+    if runtime_backend == "nunchaku" and dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("Nunchaku runtime requires float16 or bfloat16")
     metadata = json.loads((checkpoint_dir / "hsvdquant_config.json").read_text(encoding="utf-8"))
     model_kind = metadata.get("model_kind", "")
     if not model_kind:
@@ -2782,12 +2789,27 @@ def load_quant_checkpoint(
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu", weights_only=True)
     except TypeError:
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu")
+    if runtime_backend == "nunchaku":
+        from hsvdquant_int4 import build_nunchaku_linear
+
     for name, state in states.items():
-        _set_submodule(model, name, HSVQuantLinear(state, compute_dtype=dtype))
+        if runtime_backend == "nunchaku":
+            replacement = build_nunchaku_linear(
+                state,
+                dtype,
+                allow_activation_group_remap=allow_activation_group_remap,
+            )
+        else:
+            replacement = HSVQuantLinear(state, compute_dtype=dtype)
+        _set_submodule(model, name, replacement)
     del states
     gc.collect()
     model.eval()
     model.config.use_cache = False
+    metadata["runtime_backend"] = runtime_backend
+    metadata["activation_group_remap"] = bool(
+        runtime_backend == "nunchaku" and allow_activation_group_remap
+    )
     if cpu_offload_layers:
         enable_eval_cpu_offload(model, device)
     else:
@@ -3250,6 +3272,8 @@ def eval_command(args: argparse.Namespace) -> None:
         device,
         dtype,
         cpu_offload_layers=args.cpu_offload_layers,
+        runtime_backend=args.runtime_backend,
+        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     results = run_lm_eval(
         model,
@@ -3681,6 +3705,17 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--batch-size", type=int, default=1)
     evaluate.add_argument("--limit", type=float, default=None)
     evaluate.add_argument("--output", default="")
+    evaluate.add_argument(
+        "--runtime-backend",
+        choices=["eager", "nunchaku"],
+        default="eager",
+        help="eager reference path or packed Nunchaku W4A4 CUDA kernels",
+    )
+    evaluate.add_argument(
+        "--allow-activation-group-remap",
+        action="store_true",
+        help="explicitly run non-g64 checkpoints with Nunchaku's A-group 64 quantizer",
+    )
     evaluate.add_argument(
         "--cpu-offload-layers",
         action="store_true",

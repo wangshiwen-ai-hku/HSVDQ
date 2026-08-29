@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run lm-eval with decoder-layer CPU offload and per-task resume shards."""
+"""Run lm-eval with selectable runtime backend and per-task resume shards."""
 
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--limit", type=float, default=None)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--runtime-backend", choices=["eager", "nunchaku"], default="eager")
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
     parser.add_argument("--no-cpu-offload-layers", action="store_true", help="alias kept for scripts; offload is opt-in")
     parser.add_argument(
         "--cpu-offload-layers",
@@ -45,6 +47,8 @@ def main() -> None:
         device=device,
         dtype=dtype,
         cpu_offload_layers=cpu_offload,
+        runtime_backend=args.runtime_backend,
+        allow_activation_group_remap=args.allow_activation_group_remap,
     )
     results = run_lm_eval(
         model,

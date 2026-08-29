@@ -46,6 +46,7 @@ class RuntimeConfig:
     checkpoint: str | None
     dtype: str
     device: str
+    backend: str = "eager"
 
 
 class ActivationQuantLinear(nn.Module):
@@ -207,13 +208,17 @@ def load_experiment_model(
     device: torch.device,
     dtype: torch.dtype,
     cpu_offload_layers: bool = False,
+    runtime_backend: str = "eager",
+    allow_activation_group_remap: bool = False,
 ) -> tuple[nn.Module, Any, RuntimeConfig]:
     if checkpoint is None:
         model = _load_model(model_name, device, dtype, keep_on_device=not cpu_offload_layers)
         tokenizer = make_tokenizer(model_name)
         if cpu_offload_layers:
             enable_eval_cpu_offload(model, device)
-        return model, tokenizer, RuntimeConfig("fp", "fp", model_name, None, str(dtype), str(device))
+        return model, tokenizer, RuntimeConfig(
+            "fp", "fp", model_name, None, str(dtype), str(device), "dense"
+        )
 
     checkpoint_dir = Path(checkpoint)
     hsvd_config = checkpoint_dir / "hsvdquant_config.json"
@@ -224,9 +229,19 @@ def load_experiment_model(
             device,
             dtype,
             cpu_offload_layers=cpu_offload_layers,
+            runtime_backend=runtime_backend,
+            allow_activation_group_remap=allow_activation_group_remap,
         )
         method = meta.get("method", "hsvdquant")
-        return model, tokenizer, RuntimeConfig("hsvdquant", method, meta["base_model"], checkpoint, str(dtype), str(device))
+        return model, tokenizer, RuntimeConfig(
+            "hsvdquant",
+            method,
+            meta["base_model"],
+            checkpoint,
+            str(dtype),
+            str(device),
+            runtime_backend,
+        )
     if dense_config.exists():
         meta = read_json(dense_config)
         from transformers import AutoModelForCausalLM, AutoTokenizer

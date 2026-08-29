@@ -28,11 +28,19 @@ NSAMPLES="${NSAMPLES:-128}"
 SEQLEN="${SEQLEN:-512}"
 CACHE_TOKENS="${CACHE_TOKENS:-2048}"
 ACTIVATION_WEIGHT="${ACTIVATION_WEIGHT:-0.25}"
+ACTIVATION_GROUP_SIZE="${ACTIVATION_GROUP_SIZE:-128}"
+RUNTIME_BACKEND="${RUNTIME_BACKEND:-eager}"
+ALLOW_ACTIVATION_GROUP_REMAP="${ALLOW_ACTIVATION_GROUP_REMAP:-0}"
 TASKS="${TASKS:-mmlu,gsm8k,arc_challenge,arc_easy,hellaswag,piqa}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PPL_SEQLEN="${PPL_SEQLEN:-2048}"
 SKIP_QUANTIZE="${SKIP_QUANTIZE:-0}"
 SKIP_PPL="${SKIP_PPL:-0}"
+
+QUANT_RUNTIME_ARGS=(--runtime-backend "$RUNTIME_BACKEND")
+if [[ "$ALLOW_ACTIVATION_GROUP_REMAP" == "1" ]]; then
+  QUANT_RUNTIME_ARGS+=(--allow-activation-group-remap)
+fi
 
 mkdir -p "$OUTPUT" "$OUTPUT/metrics" "$OUTPUT/logs"
 
@@ -51,7 +59,7 @@ if [[ "$SKIP_QUANTIZE" != "1" && ! -f "$OUTPUT/hsvdquant.pt" ]]; then
     --activation-cache-tokens "$CACHE_TOKENS" \
     --bits 4 \
     --activation-bits 4 \
-    --activation-group-size 128 \
+    --activation-group-size "$ACTIVATION_GROUP_SIZE" \
     --group-size 128 \
     --block-size 128 \
     --rank 4 \
@@ -86,6 +94,7 @@ if [[ "$SKIP_PPL" != "1" ]]; then
     python scripts/benchmarks/eval_ppl.py \
       --model "$MODEL" \
       --checkpoint "$OUTPUT" \
+      "${QUANT_RUNTIME_ARGS[@]}" \
       --dataset wikitext2 \
       --seqlen "$PPL_SEQLEN" \
       --device "$DEVICE_QUANT" \
@@ -95,7 +104,7 @@ if [[ "$SKIP_PPL" != "1" ]]; then
   fi
 fi
 
-echo "[run] starting lm-eval (layer CPU offload, per-task shards, batch_size=$BATCH_SIZE)"
+echo "[run] starting lm-eval (backend=$RUNTIME_BACKEND, no layer offload, batch_size=$BATCH_SIZE)"
 
 python scripts/benchmarks/eval_lm.py \
   --model "$MODEL" \
@@ -110,6 +119,7 @@ FP16_PID=$!
 python scripts/benchmarks/eval_lm.py \
   --model "$MODEL" \
   --checkpoint "$OUTPUT" \
+  "${QUANT_RUNTIME_ARGS[@]}" \
   --device "$DEVICE_QUANT" \
   --dtype float16 \
   --tasks "$TASKS" \
