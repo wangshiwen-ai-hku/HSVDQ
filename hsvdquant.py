@@ -2792,8 +2792,11 @@ def load_quant_checkpoint(
     if runtime_backend == "nunchaku":
         from hsvdquant_int4 import build_nunchaku_linear
 
+    activation_group_remapped = False
     for name, state in states.items():
         if runtime_backend == "nunchaku":
+            source_activation_group = int(state.get("activation_group_size", 0))
+            activation_group_remapped |= source_activation_group != 64
             replacement = build_nunchaku_linear(
                 state,
                 dtype,
@@ -2807,9 +2810,7 @@ def load_quant_checkpoint(
     model.eval()
     model.config.use_cache = False
     metadata["runtime_backend"] = runtime_backend
-    metadata["activation_group_remap"] = bool(
-        runtime_backend == "nunchaku" and allow_activation_group_remap
-    )
+    metadata["activation_group_remap"] = activation_group_remapped
     if cpu_offload_layers:
         enable_eval_cpu_offload(model, device)
     else:

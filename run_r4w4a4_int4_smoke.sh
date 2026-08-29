@@ -7,6 +7,12 @@ OUTPUT=${OUTPUT:-outputs/qwen3-8b-v2-r4w4a4/int4-smoke}
 DEVICE=${DEVICE:-cuda:0}
 DTYPE=${DTYPE:-float16}
 PYTHON_BIN=${PYTHON_BIN:-python}
+ALLOW_ACTIVATION_GROUP_REMAP=${ALLOW_ACTIVATION_GROUP_REMAP:-1}
+
+RUNTIME_ARGS=(--runtime-backend nunchaku)
+if [[ "${ALLOW_ACTIVATION_GROUP_REMAP}" == "1" ]]; then
+  RUNTIME_ARGS+=(--allow-activation-group-remap)
+fi
 
 mkdir -p "${OUTPUT}"
 
@@ -17,8 +23,7 @@ mkdir -p "${OUTPUT}"
 "${PYTHON_BIN}" scripts/benchmarks/bench_memory.py \
   --model "${MODEL}" \
   --checkpoint "${CHECKPOINT}" \
-  --runtime-backend nunchaku \
-  --allow-activation-group-remap \
+  "${RUNTIME_ARGS[@]}" \
   --device "${DEVICE}" \
   --dtype "${DTYPE}" \
   --seqlen 512 \
@@ -29,8 +34,7 @@ mkdir -p "${OUTPUT}"
 "${PYTHON_BIN}" scripts/benchmarks/bench_latency.py \
   --model "${MODEL}" \
   --checkpoint "${CHECKPOINT}" \
-  --runtime-backend nunchaku \
-  --allow-activation-group-remap \
+  "${RUNTIME_ARGS[@]}" \
   --device "${DEVICE}" \
   --dtype "${DTYPE}" \
   --prompt-len 256 \
@@ -42,8 +46,7 @@ mkdir -p "${OUTPUT}"
 "${PYTHON_BIN}" scripts/benchmarks/eval_lm.py \
   --model "${MODEL}" \
   --checkpoint "${CHECKPOINT}" \
-  --runtime-backend nunchaku \
-  --allow-activation-group-remap \
+  "${RUNTIME_ARGS[@]}" \
   --tasks piqa \
   --limit 32 \
   --batch-size 1 \

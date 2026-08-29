@@ -30,6 +30,8 @@ conda activate pde
 bash run_r4w4a4_int4_smoke.sh
 ```
 
+For a strict group-64 checkpoint, set `ALLOW_ACTIVATION_GROUP_REMAP=0`.
+
 The script performs a CUDA numerical check, records full-GPU memory and latency
 without decoder-layer CPU offload, and runs 32 PIQA samples. Override `MODEL`,
 `CHECKPOINT`, `OUTPUT`, `DEVICE`, `DTYPE`, or `PYTHON_BIN` as needed.
