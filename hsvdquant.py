@@ -2753,6 +2753,17 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return mapping[name]
 
 
+def _materialize_eager_qweights(model: nn.Module, device: torch.device, dtype: torch.dtype) -> None:
+    """Dequant residual once, keep it on GPU, and park int8 codes on CPU."""
+    for module in model.modules():
+        if not isinstance(module, HSVQuantLinear):
+            continue
+        module.persist_qweight = True
+        module._qweight = module._build_qweight(dtype).to(device=device, dtype=dtype)
+        module.register_buffer("codes", module.codes.detach().to("cpu"), persistent=True)
+        module.register_buffer("scales", module.scales.detach().to("cpu"), persistent=True)
+
+
 def load_quant_checkpoint(
     checkpoint_dir: Path,
     device: torch.device,
@@ -2760,6 +2771,7 @@ def load_quant_checkpoint(
     *,
     cpu_offload_layers: bool = False,
     runtime_backend: str = "eager",
+    persist_qweight: bool = False,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -2800,12 +2812,17 @@ def load_quant_checkpoint(
     del states
     gc.collect()
     model.eval()
-    model.config.use_cache = False
     metadata["runtime_backend"] = runtime_backend
     if cpu_offload_layers:
+        model.config.use_cache = False
         enable_eval_cpu_offload(model, device)
     else:
         model.to(device)
+        model.config.use_cache = True
+        if persist_qweight and runtime_backend == "eager":
+            _materialize_eager_qweights(model, device, dtype)
+            gc.collect()
+    metadata["persist_qweight"] = bool(persist_qweight and runtime_backend == "eager" and not cpu_offload_layers)
     return model, tokenizer, metadata
 
 
@@ -3265,6 +3282,7 @@ def eval_command(args: argparse.Namespace) -> None:
         dtype,
         cpu_offload_layers=args.cpu_offload_layers,
         runtime_backend=args.runtime_backend,
+        persist_qweight=args.persist_qweight,
     )
     results = run_lm_eval(
         model,
@@ -3712,6 +3730,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cpu-offload-layers",
         action="store_false",
         dest="cpu_offload_layers",
+    )
+    evaluate.add_argument(
+        "--persist-qweight",
+        action="store_true",
+        help="eager only: dequant residual once and keep FP16 GEMM weights on GPU",
     )
     evaluate.add_argument(
         "--no-resume",

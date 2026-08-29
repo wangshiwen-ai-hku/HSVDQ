@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="page decoder blocks through GPU (lower peak, much slower; for 14B+)",
     )
+    parser.add_argument(
+        "--persist-qweight",
+        action="store_true",
+        help="eager only: dequant residual once and keep FP16 GEMM weights on GPU",
+    )
     parser.add_argument("--no-resume", action="store_true")
     return parser
 
@@ -47,6 +52,7 @@ def main() -> None:
         dtype=dtype,
         cpu_offload_layers=cpu_offload,
         runtime_backend=args.runtime_backend,
+        persist_qweight=args.persist_qweight,
     )
     results = run_lm_eval(
         model,

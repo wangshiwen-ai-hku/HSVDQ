@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--runtime-backend", choices=["eager", "hsvdq_cuda"], default="eager")
+    parser.add_argument(
+        "--persist-qweight",
+        action="store_true",
+        help="eager only: dequant residual once and keep FP16 GEMM weights on GPU",
+    )
     parser.add_argument("--output", required=True)
     return parser
 
@@ -45,6 +50,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         runtime_backend=args.runtime_backend,
+        persist_qweight=args.persist_qweight,
     )
     input_ids = get_eval_input_ids(
         args.dataset,

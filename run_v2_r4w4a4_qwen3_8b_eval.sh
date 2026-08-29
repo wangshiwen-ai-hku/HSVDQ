@@ -33,19 +33,41 @@ ACTIVATION_GROUP_SIZE="${ACTIVATION_GROUP_SIZE:-$GROUP_SIZE}"
 D_CLIP="${D_CLIP:-32}"
 RUNTIME_BACKEND="${RUNTIME_BACKEND:-hsvdq_cuda}"
 TASKS="${TASKS:-mmlu,gsm8k,arc_challenge,arc_easy,hellaswag,piqa}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 PPL_SEQLEN="${PPL_SEQLEN:-2048}"
 SKIP_QUANTIZE="${SKIP_QUANTIZE:-0}"
 SKIP_PPL="${SKIP_PPL:-0}"
 SKIP_FP16_EVAL="${SKIP_FP16_EVAL:-0}"
 SKIP_QUANT_EVAL="${SKIP_QUANT_EVAL:-0}"
 FP16_METRICS_SOURCE="${FP16_METRICS_SOURCE:-}"
+PERSIST_QWEIGHT="${PERSIST_QWEIGHT:-1}"
+
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
+if [[ -z "${CUDA_HOME:-}" && -d /usr/local/cuda-12.6 ]]; then
+  export CUDA_HOME=/usr/local/cuda-12.6
+fi
+if [[ -n "${CUDA_HOME:-}" ]]; then
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
+
+if [[ -f "$OUTPUT/hsvdquant_config.json" ]]; then
+  CKPT_GROUP="$(python -c "import json; c=json.load(open('$OUTPUT/hsvdquant_config.json')); q=c['quant_config']; print(int(q.get('group_size', 0)), int(q.get('activation_group_size', 0)))")"
+  CKPT_W_GROUP="${CKPT_GROUP%% *}"
+  CKPT_A_GROUP="${CKPT_GROUP##* }"
+  if [[ "$RUNTIME_BACKEND" == "hsvdq_cuda" && ( "$CKPT_W_GROUP" != "128" || "$CKPT_A_GROUP" != "128" ) ]]; then
+    echo "[run] hsvdq_cuda kernel is W4A4 g128 only (ckpt W$CKPT_W_GROUP A$CKPT_A_GROUP); switching to eager"
+    RUNTIME_BACKEND=eager
+  fi
+fi
 
 QUANT_RUNTIME_ARGS=(--runtime-backend "$RUNTIME_BACKEND")
+if [[ "$RUNTIME_BACKEND" == "eager" && "$PERSIST_QWEIGHT" == "1" ]]; then
+  QUANT_RUNTIME_ARGS+=(--persist-qweight)
+fi
 
 mkdir -p "$OUTPUT" "$OUTPUT/metrics" "$OUTPUT/logs"
 
-echo "[run] model=$MODEL output=$OUTPUT seqlen=$SEQLEN nsamples=$NSAMPLES group=$GROUP_SIZE act_group=$ACTIVATION_GROUP_SIZE d_clip=$D_CLIP backend=$RUNTIME_BACKEND fp16_device=$DEVICE_FP16 quant_device=$DEVICE_QUANT"
+echo "[run] model=$MODEL output=$OUTPUT seqlen=$SEQLEN nsamples=$NSAMPLES group=$GROUP_SIZE act_group=$ACTIVATION_GROUP_SIZE d_clip=$D_CLIP backend=$RUNTIME_BACKEND persist_qweight=$PERSIST_QWEIGHT batch=$BATCH_SIZE fp16_device=$DEVICE_FP16 quant_device=$DEVICE_QUANT"
 
 if [[ -n "$FP16_METRICS_SOURCE" ]]; then
   mkdir -p "$OUTPUT/metrics"

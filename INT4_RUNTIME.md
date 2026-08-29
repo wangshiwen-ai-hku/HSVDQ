@@ -108,12 +108,40 @@ layer offload off.
 ## Qwen3-8B eval driver
 
 `run_v2_r4w4a4_qwen3_8b_eval.sh` defaults to `--runtime-backend hsvdq_cuda`
-and does not enable layer offload for eval. Useful env knobs:
+and does not enable layer offload for eval. The current 8x8x32 WMMA kernel
+is a packed-memory / correctness path, not a fast decode kernel (~2.4 tok/s
+on 4090). For accuracy eval (especially GSM8K generate), **eager with
+`--persist-qweight` is faster**: dequant residual once, then cuBLAS FP16
+GEMM, and keep KV cache on. The driver does that automatically when the
+checkpoint is not W4A4 g128.
 
-- `RUNTIME_BACKEND` — `hsvdq_cuda` (default) or `eager`
+Useful env knobs:
+
+- `RUNTIME_BACKEND` — `hsvdq_cuda` (default for g128) or `eager`
+- `BATCH_SIZE` — default 8 (loglikelihood tasks); lower if GSM8K OOMs
+- `PERSIST_QWEIGHT` — default 1 for eager (skip per-token residual dequant)
 - `GROUP_SIZE` / `ACTIVATION_GROUP_SIZE` / `D_CLIP` — calibration only
 - `SKIP_QUANTIZE`, `SKIP_PPL`, `SKIP_FP16_EVAL`, `SKIP_QUANT_EVAL`
 - `FP16_METRICS_SOURCE` — copy existing FP16 metrics into `$OUTPUT/metrics`
 
-The native kernel requires group size 128. A G64 checkpoint will not
-dispatch on `hsvdq_cuda`.
+The native kernel requires group size 128. A G64 checkpoint is switched to
+eager instead of failing dispatch. Resume is per-task:
+`$OUTPUT/metrics/lm_eval_quantized_<task>.json`.
+
+G64 accuracy eval:
+
+```bash
+OUTPUT=outputs/qwen3-8b-v2-r4w4a4-g64 \
+GROUP_SIZE=64 ACTIVATION_GROUP_SIZE=64 \
+SKIP_QUANTIZE=1 SKIP_PPL=1 SKIP_FP16_EVAL=1 \
+FP16_METRICS_SOURCE=outputs/qwen3-8b-v2-r4w4a4 \
+./run_v2_r4w4a4_qwen3_8b_eval.sh
+```
+
+G128 packed-kernel eval (memory / kernel check, slower GSM8K):
+
+```bash
+OUTPUT=outputs/qwen3-8b-v2-r4w4a4 RUNTIME_BACKEND=hsvdq_cuda \
+SKIP_QUANTIZE=1 SKIP_PPL=1 SKIP_FP16_EVAL=1 \
+./run_v2_r4w4a4_qwen3_8b_eval.sh
+```
