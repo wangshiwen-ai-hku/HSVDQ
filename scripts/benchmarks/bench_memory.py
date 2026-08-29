@@ -19,10 +19,15 @@ from common import (
 )
 
 
+def _cuda_index(device: torch.device) -> int:
+    torch.cuda.set_device(device)
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
 def memory_snapshot(device: torch.device) -> dict[str, float]:
     if device.type != "cuda":
         return {}
-    index = torch.cuda.current_device() if device.index is None else device.index
+    index = _cuda_index(device)
     return {
         "allocated_gb": torch.cuda.memory_allocated(index) / 1024**3,
         "reserved_gb": torch.cuda.memory_reserved(index) / 1024**3,
@@ -33,8 +38,8 @@ def memory_snapshot(device: torch.device) -> dict[str, float]:
 
 def reset_peak(device: torch.device) -> None:
     if device.type == "cuda":
+        index = _cuda_index(device)
         torch.cuda.empty_cache()
-        index = torch.cuda.current_device() if device.index is None else device.index
         torch.cuda.reset_peak_memory_stats(index)
         torch.cuda.synchronize(index)
 

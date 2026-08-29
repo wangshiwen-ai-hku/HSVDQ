@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dtype = _dtype_from_name(args.dtype)
     model, tokenizer, runtime = load_experiment_model(
         model_name=args.model,

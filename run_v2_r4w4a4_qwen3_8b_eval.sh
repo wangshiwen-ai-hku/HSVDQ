@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # V2 r4 W4A4 calibration + FP16 / quantized eval on Qwen3-8B (~7B non-embed).
-# Eval: ephemeral reconstructed weights, continuation-only logits, per-task
-# shards. Layer CPU offload is opt-in (--cpu-offload-layers) for 14B+.
+# Quant eval default: packed hsvdq_cuda (no dense residual reconstruct).
+# Layer CPU offload is opt-in (--cpu-offload-layers) for 14B+ or OOM fallback.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,19 +28,36 @@ NSAMPLES="${NSAMPLES:-128}"
 SEQLEN="${SEQLEN:-512}"
 CACHE_TOKENS="${CACHE_TOKENS:-2048}"
 ACTIVATION_WEIGHT="${ACTIVATION_WEIGHT:-0.25}"
-ACTIVATION_GROUP_SIZE="${ACTIVATION_GROUP_SIZE:-128}"
+GROUP_SIZE="${GROUP_SIZE:-128}"
+ACTIVATION_GROUP_SIZE="${ACTIVATION_GROUP_SIZE:-$GROUP_SIZE}"
+D_CLIP="${D_CLIP:-32}"
 RUNTIME_BACKEND="${RUNTIME_BACKEND:-hsvdq_cuda}"
 TASKS="${TASKS:-mmlu,gsm8k,arc_challenge,arc_easy,hellaswag,piqa}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PPL_SEQLEN="${PPL_SEQLEN:-2048}"
 SKIP_QUANTIZE="${SKIP_QUANTIZE:-0}"
 SKIP_PPL="${SKIP_PPL:-0}"
+SKIP_FP16_EVAL="${SKIP_FP16_EVAL:-0}"
+SKIP_QUANT_EVAL="${SKIP_QUANT_EVAL:-0}"
+FP16_METRICS_SOURCE="${FP16_METRICS_SOURCE:-}"
 
 QUANT_RUNTIME_ARGS=(--runtime-backend "$RUNTIME_BACKEND")
 
 mkdir -p "$OUTPUT" "$OUTPUT/metrics" "$OUTPUT/logs"
 
-echo "[run] model=$MODEL output=$OUTPUT fp16_device=$DEVICE_FP16 quant_device=$DEVICE_QUANT"
+echo "[run] model=$MODEL output=$OUTPUT seqlen=$SEQLEN nsamples=$NSAMPLES group=$GROUP_SIZE act_group=$ACTIVATION_GROUP_SIZE d_clip=$D_CLIP backend=$RUNTIME_BACKEND fp16_device=$DEVICE_FP16 quant_device=$DEVICE_QUANT"
+
+if [[ -n "$FP16_METRICS_SOURCE" ]]; then
+  mkdir -p "$OUTPUT/metrics"
+  for name in ppl_fp16_wikitext2.json lm_eval_fp16.json; do
+    src="$FP16_METRICS_SOURCE/$name"
+    dst="$OUTPUT/metrics/$name"
+    if [[ -f "$src" && ! -f "$dst" ]]; then
+      cp -a "$src" "$dst"
+      echo "[run] copied $name from $FP16_METRICS_SOURCE"
+    fi
+  done
+fi
 
 if [[ "$SKIP_QUANTIZE" != "1" && ! -f "$OUTPUT/hsvdquant.pt" ]]; then
   python hsvdquant.py quantize \
@@ -56,7 +73,7 @@ if [[ "$SKIP_QUANTIZE" != "1" && ! -f "$OUTPUT/hsvdquant.pt" ]]; then
     --bits 4 \
     --activation-bits 4 \
     --activation-group-size "$ACTIVATION_GROUP_SIZE" \
-    --group-size 128 \
+    --group-size "$GROUP_SIZE" \
     --block-size 128 \
     --rank 4 \
     --ablation-mode v2 \
@@ -67,6 +84,7 @@ if [[ "$SKIP_QUANTIZE" != "1" && ! -f "$OUTPUT/hsvdquant.pt" ]]; then
     --outer-iters 2 \
     --d-mode cached \
     --d-steps 20 \
+    --d-clip "$D_CLIP" \
     --cpu-offload-layers \
     --layer-checkpoints \
     --seed 0 \
@@ -102,29 +120,42 @@ fi
 
 echo "[run] starting lm-eval (backend=$RUNTIME_BACKEND, no layer offload, batch_size=$BATCH_SIZE)"
 
-python scripts/benchmarks/eval_lm.py \
-  --model "$MODEL" \
-  --device "$DEVICE_FP16" \
-  --dtype float16 \
-  --tasks "$TASKS" \
-  --batch-size "$BATCH_SIZE" \
-  --output "$OUTPUT/metrics/lm_eval_fp16.json" \
-  2>&1 | tee "$OUTPUT/logs/lm_eval_fp16.log" &
-FP16_PID=$!
+if [[ "$SKIP_FP16_EVAL" != "1" && ! -f "$OUTPUT/metrics/lm_eval_fp16.json" ]]; then
+  python scripts/benchmarks/eval_lm.py \
+    --model "$MODEL" \
+    --device "$DEVICE_FP16" \
+    --dtype float16 \
+    --tasks "$TASKS" \
+    --batch-size "$BATCH_SIZE" \
+    --output "$OUTPUT/metrics/lm_eval_fp16.json" \
+    2>&1 | tee "$OUTPUT/logs/lm_eval_fp16.log" &
+  FP16_PID=$!
+else
+  echo "[run] skip FP16 lm-eval"
+  FP16_PID=""
+fi
 
-python scripts/benchmarks/eval_lm.py \
-  --model "$MODEL" \
-  --checkpoint "$OUTPUT" \
-  "${QUANT_RUNTIME_ARGS[@]}" \
-  --device "$DEVICE_QUANT" \
-  --dtype float16 \
-  --tasks "$TASKS" \
-  --batch-size "$BATCH_SIZE" \
-  --output "$OUTPUT/metrics/lm_eval_quantized.json" \
-  2>&1 | tee "$OUTPUT/logs/lm_eval_quantized.log" &
-QUANT_PID=$!
+if [[ "$SKIP_QUANT_EVAL" != "1" ]]; then
+  python scripts/benchmarks/eval_lm.py \
+    --model "$MODEL" \
+    --checkpoint "$OUTPUT" \
+    "${QUANT_RUNTIME_ARGS[@]}" \
+    --device "$DEVICE_QUANT" \
+    --dtype float16 \
+    --tasks "$TASKS" \
+    --batch-size "$BATCH_SIZE" \
+    --output "$OUTPUT/metrics/lm_eval_quantized.json" \
+    2>&1 | tee "$OUTPUT/logs/lm_eval_quantized.log" &
+  QUANT_PID=$!
+else
+  QUANT_PID=""
+fi
 
-wait "$FP16_PID"
-wait "$QUANT_PID"
+if [[ -n "$FP16_PID" ]]; then
+  wait "$FP16_PID"
+fi
+if [[ -n "$QUANT_PID" ]]; then
+  wait "$QUANT_PID"
+fi
 
 echo "[run] done. metrics under $OUTPUT/metrics"

@@ -70,6 +70,9 @@ python hsvdquant.py eval \
 The `eval` subcommand passes the already-instantiated quantized model to lm-eval's Hugging Face
 backend, so the custom FP low-rank plus W4A4 runtime remains active.
 
+For packed W4A4 Tensor Core inference (no dense residual reconstruct, no
+Nunchaku), use `--runtime-backend hsvdq_cuda`. See [`INT4_RUNTIME.md`](INT4_RUNTIME.md).
+
 ## Standard Hugging Face compatibility export
 
 Add
@@ -92,10 +95,11 @@ weights. It is a portable W4A16 reconstruction for compatibility testing; use
 
 ## Artifacts
 
-- `hsvdquant.pt`: compact int8 code tensors (4-bit values are not bit-packed), group scales,
+- `hsvdquant.pt`: compact int8 code tensors (4-bit values are not bit-packed on disk), group scales,
   smoothing vectors, and low-rank factors.
 - `hsvdquant_config.json`: base model and calibration/quantization metadata.
 - tokenizer files: enough to reconstruct the lm-eval wrapper after the base weights are pulled.
 
-The implementation intentionally keeps `Z` in `int8` for correctness and debuggability. Bit
-packing and fused kernels are deployment optimizations, not part of the calibration algorithm.
+Calibration keeps `Z` in `int8` for correctness and debuggability. The optional
+`hsvdq_cuda` backend packs those codes to W4 at load time and runs a fused W4A4
+WMMA kernel; see [`INT4_RUNTIME.md`](INT4_RUNTIME.md).

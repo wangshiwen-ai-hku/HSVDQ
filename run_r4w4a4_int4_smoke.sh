@@ -9,6 +9,13 @@ DTYPE=${DTYPE:-float16}
 PYTHON_BIN=${PYTHON_BIN:-python}
 RUNTIME_ARGS=(--runtime-backend hsvdq_cuda)
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
+# PyTorch 2.8+cu126 needs the 12.6 toolkit; the machine default nvcc may be newer.
+if [[ -z "${CUDA_HOME:-}" && -d /usr/local/cuda-12.6 ]]; then
+  export CUDA_HOME=/usr/local/cuda-12.6
+fi
+if [[ -n "${CUDA_HOME:-}" ]]; then
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
 
 mkdir -p "${OUTPUT}"
 
