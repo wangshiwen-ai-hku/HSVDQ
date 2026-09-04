@@ -1,5 +1,48 @@
 # Native H-SVDQuant CUDA runtime
 
+## Hybrid accelerated runtime
+
+The `hybrid` backend combines two packed implementations over the same
+checkpoint:
+
+- `M >= --hybrid-threshold`: Nunchaku W4A4 for prefill and large batches.
+- `M < --hybrid-threshold`: repository-local W4A16 GEMV for token decode.
+
+The W4A16 kernel does not reconstruct an FP16 weight. Its first launch computes
+the smoothed activation and rank projection once; its second launch streams the
+packed W4 residual and fuses scale application, low-rank up projection, and
+bias. Version 1 keeps both Nunchaku and row-major W4 layouts in VRAM so the
+performance hypothesis can be tested before implementing a shared layout.
+
+Install a Nunchaku wheel matching the cloud Python, PyTorch, and CUDA versions,
+then run the complete comparison:
+
+```bash
+conda activate pde
+CHECKPOINT=outputs/qwen3-8b-v2-r4w4a4 \
+  bash run_hybrid_runtime_smoke.sh
+```
+
+The script runs dense, pure W4A16, pure Nunchaku W4A4, and automatic hybrid
+latency tests. It also writes `linear_crossover.json` with per-shape kernel
+crossovers and `summary.json` with end-to-end speedups. Set
+`ALLOW_ACTIVATION_GROUP_REMAP=0` for a checkpoint calibrated with activation
+group 64. The default value `1` lets the existing group-128 checkpoint run, but
+changes its activation quantization and is suitable only for performance smoke
+testing.
+
+Useful controls:
+
+```bash
+HYBRID_THRESHOLD=64 RUN_PURE_W4A4=1 RUN_HSVDQ_CUDA=0 \
+  bash run_hybrid_runtime_smoke.sh
+```
+
+The runtime fails instead of falling back to eager execution. Use
+`--hybrid-profile-stats` to record the W4A4/W4A16 call and row counts in result
+JSON files. See [`HYBRID_RUNTIME_DESIGN.md`](HYBRID_RUNTIME_DESIGN.md) for the
+operator contract, acceptance gates, and remaining production work.
+
 `hsvdq_cuda` is a repository-local packed inference backend. It has no
 Nunchaku dependency and does not reconstruct a dense FP16 residual weight.
 Calibration still writes compact `int8` codes in `hsvdquant.pt`; packing to

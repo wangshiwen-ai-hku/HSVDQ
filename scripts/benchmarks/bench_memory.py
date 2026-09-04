@@ -56,7 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
-    parser.add_argument("--runtime-backend", choices=["eager", "hsvdq_cuda"], default="eager")
+    parser.add_argument(
+        "--runtime-backend",
+        choices=["eager", "hsvdq_cuda", "w4a16", "nunchaku", "hybrid"],
+        default="eager",
+    )
+    parser.add_argument("--hybrid-policy", choices=["auto", "force_w4a4", "force_w4a16"], default="auto")
+    parser.add_argument("--hybrid-threshold", type=int, default=128)
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
+    parser.add_argument("--hybrid-profile-stats", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)
     return parser
@@ -75,6 +83,10 @@ def main() -> None:
         device=device,
         dtype=dtype,
         runtime_backend=args.runtime_backend,
+        hybrid_policy=args.hybrid_policy,
+        hybrid_threshold=args.hybrid_threshold,
+        allow_activation_group_remap=args.allow_activation_group_remap,
+        hybrid_profile_stats=args.hybrid_profile_stats,
     )
     metrics: dict[str, object] = {"load": memory_snapshot(device)}
     vocab = len(tokenizer)
@@ -101,6 +113,10 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     metrics["ppl"] = {**memory_snapshot(device), **ppl_metrics}
+    if args.runtime_backend == "hybrid" and args.hybrid_profile_stats:
+        from hsvdquant_hybrid import collect_hybrid_runtime_stats
+
+        metrics["hybrid_runtime"] = collect_hybrid_runtime_stats(model)
 
     payload = result_payload(runtime, args, metrics)
     write_json(Path(args.output), payload)

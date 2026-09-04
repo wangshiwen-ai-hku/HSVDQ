@@ -22,7 +22,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--limit", type=float, default=None)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--runtime-backend", choices=["eager", "hsvdq_cuda"], default="eager")
+    parser.add_argument(
+        "--runtime-backend",
+        choices=["eager", "hsvdq_cuda", "w4a16", "nunchaku", "hybrid"],
+        default="eager",
+    )
+    parser.add_argument("--hybrid-policy", choices=["auto", "force_w4a4", "force_w4a16"], default="auto")
+    parser.add_argument("--hybrid-threshold", type=int, default=128)
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
+    parser.add_argument("--hybrid-profile-stats", action="store_true")
     parser.add_argument("--no-cpu-offload-layers", action="store_true", help="alias kept for scripts; offload is opt-in")
     parser.add_argument(
         "--cpu-offload-layers",
@@ -53,6 +61,10 @@ def main() -> None:
         cpu_offload_layers=cpu_offload,
         runtime_backend=args.runtime_backend,
         persist_qweight=args.persist_qweight,
+        hybrid_policy=args.hybrid_policy,
+        hybrid_threshold=args.hybrid_threshold,
+        allow_activation_group_remap=args.allow_activation_group_remap,
+        hybrid_profile_stats=args.hybrid_profile_stats,
     )
     results = run_lm_eval(
         model,

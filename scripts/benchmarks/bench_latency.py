@@ -49,6 +49,31 @@ def timed_loop(fn, warmup: int, iters: int, device: torch.device) -> list[float]
     return values
 
 
+def timed_generation(
+    fn,
+    warmup: int,
+    iters: int,
+    device: torch.device,
+    prompt_tokens: int,
+) -> tuple[list[float], list[int]]:
+    for _ in range(warmup):
+        fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    values: list[float] = []
+    generated_tokens: list[int] = []
+    for _ in range(iters):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        output = fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        values.append(time.perf_counter() - start)
+        generated_tokens.append(int(output.numel() - prompt_tokens))
+    return values, generated_tokens
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="models/Qwen/Qwen3-0.6B")
@@ -60,7 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
-    parser.add_argument("--runtime-backend", choices=["eager", "hsvdq_cuda"], default="eager")
+    parser.add_argument(
+        "--runtime-backend",
+        choices=["eager", "hsvdq_cuda", "w4a16", "nunchaku", "hybrid"],
+        default="eager",
+    )
+    parser.add_argument("--hybrid-policy", choices=["auto", "force_w4a4", "force_w4a16"], default="auto")
+    parser.add_argument("--hybrid-threshold", type=int, default=128)
+    parser.add_argument("--allow-activation-group-remap", action="store_true")
+    parser.add_argument("--hybrid-profile-stats", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)
     return parser
@@ -80,6 +113,10 @@ def main() -> None:
         device=device,
         dtype=dtype,
         runtime_backend=args.runtime_backend,
+        hybrid_policy=args.hybrid_policy,
+        hybrid_threshold=args.hybrid_threshold,
+        allow_activation_group_remap=args.allow_activation_group_remap,
+        hybrid_profile_stats=args.hybrid_profile_stats,
     )
     vocab = len(tokenizer)
     input_ids = torch.randint(0, vocab, (args.batch_size, args.prompt_len), device=device)
@@ -89,17 +126,26 @@ def main() -> None:
         model(input_ids, use_cache=True)
 
     prefill_values = timed_loop(prefill, args.warmup, args.iters, device)
-    with torch.inference_mode():
-        cache = model(input_ids, use_cache=True).past_key_values
     decode_ids = torch.randint(0, vocab, (args.batch_size, 1), device=device)
 
-    def decode_one():
-        model(decode_ids, past_key_values=cache, use_cache=True)
+    with torch.inference_mode():
+        cache = model(input_ids, use_cache=True).past_key_values
 
-    decode_values = timed_loop(decode_one, args.warmup, args.iters, device)
+    def decode_one():
+        nonlocal cache
+        output = model(decode_ids, past_key_values=cache, use_cache=True)
+        cache = output.past_key_values
+
+    for _ in range(args.warmup):
+        decode_one()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    # Reset after warmup, then measure one intentional continuous decode window.
+    cache = model(input_ids, use_cache=True).past_key_values
+    decode_values = timed_loop(decode_one, 0, args.iters, device)
 
     def generate_once():
-        model.generate(
+        return model.generate(
             input_ids,
             max_new_tokens=args.decode_len,
             do_sample=False,
@@ -107,15 +153,30 @@ def main() -> None:
         )
 
     # Full generate is expensive; keep the requested iteration count but users can lower it.
-    generate_values = timed_loop(generate_once, max(1, args.warmup // 2), max(1, args.iters // 10), device)
+    generate_values, generated_tokens = timed_generation(
+        generate_once,
+        max(1, args.warmup // 2),
+        max(1, args.iters // 10),
+        device,
+        input_ids.numel(),
+    )
+    generate_metrics = summarize(generate_values, 1)
+    generate_metrics["tokens_per_s"] = sum(generated_tokens) / sum(generate_values)
+    generate_metrics["generated_tokens_mean"] = statistics.fmean(generated_tokens)
     metrics = {
         "prefill": summarize(prefill_values, args.batch_size * args.prompt_len),
         "decode_one_token": summarize(decode_values, args.batch_size),
-        "generate": summarize(generate_values, args.batch_size * args.decode_len),
+        "generate": generate_metrics,
         "prompt_len": args.prompt_len,
         "decode_len": args.decode_len,
         "batch_size": args.batch_size,
+        "decode_context_start": args.prompt_len,
+        "decode_context_end": args.prompt_len + args.iters,
     }
+    if args.runtime_backend == "hybrid" and args.hybrid_profile_stats:
+        from hsvdquant_hybrid import collect_hybrid_runtime_stats
+
+        metrics["hybrid_runtime"] = collect_hybrid_runtime_stats(model)
     payload = result_payload(runtime, args, metrics)
     write_json(Path(args.output), payload)
     print(payload["metrics"])

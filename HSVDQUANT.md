@@ -70,8 +70,10 @@ python hsvdquant.py eval \
 The `eval` subcommand passes the already-instantiated quantized model to lm-eval's Hugging Face
 backend, so the custom FP low-rank plus W4A4 runtime remains active.
 
-For packed W4A4 Tensor Core inference (no dense residual reconstruct, no
-Nunchaku), use `--runtime-backend hsvdq_cuda`. See [`INT4_RUNTIME.md`](INT4_RUNTIME.md).
+For accelerated inference, use `--runtime-backend hybrid` to dispatch Nunchaku
+W4A4 for prefill and packed W4A16 for decode. The older correctness-oriented
+native path remains available as `--runtime-backend hsvdq_cuda`. See
+[`INT4_RUNTIME.md`](INT4_RUNTIME.md).
 
 ## Standard Hugging Face compatibility export
 

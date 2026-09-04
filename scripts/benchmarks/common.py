@@ -47,6 +47,11 @@ class RuntimeConfig:
     dtype: str
     device: str
     backend: str = "eager"
+    hybrid_policy: str | None = None
+    hybrid_threshold: int | None = None
+    activation_group_remap: bool = False
+    nunchaku_version: str | None = None
+    weight_layout: str | None = None
 
 
 class ActivationQuantLinear(nn.Module):
@@ -210,6 +215,10 @@ def load_experiment_model(
     cpu_offload_layers: bool = False,
     runtime_backend: str = "eager",
     persist_qweight: bool = False,
+    hybrid_policy: str = "auto",
+    hybrid_threshold: int = 128,
+    allow_activation_group_remap: bool = False,
+    hybrid_profile_stats: bool = False,
 ) -> tuple[nn.Module, Any, RuntimeConfig]:
     if checkpoint is None:
         model = _load_model(model_name, device, dtype, keep_on_device=not cpu_offload_layers)
@@ -231,6 +240,10 @@ def load_experiment_model(
             cpu_offload_layers=cpu_offload_layers,
             runtime_backend=runtime_backend,
             persist_qweight=persist_qweight,
+            hybrid_policy=hybrid_policy,
+            hybrid_threshold=hybrid_threshold,
+            allow_activation_group_remap=allow_activation_group_remap,
+            hybrid_profile_stats=hybrid_profile_stats,
         )
         method = meta.get("method", "hsvdquant")
         return model, tokenizer, RuntimeConfig(
@@ -241,6 +254,11 @@ def load_experiment_model(
             str(dtype),
             str(device),
             runtime_backend,
+            hybrid_policy if runtime_backend == "hybrid" else None,
+            hybrid_threshold if runtime_backend == "hybrid" else None,
+            bool(meta.get("activation_group_remap", False)),
+            meta.get("nunchaku_version"),
+            meta.get("hybrid_weight_layout"),
         )
     if dense_config.exists():
         meta = read_json(dense_config)

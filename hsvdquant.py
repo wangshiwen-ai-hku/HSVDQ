@@ -2923,13 +2923,19 @@ def load_quant_checkpoint(
     cpu_offload_layers: bool = False,
     runtime_backend: str = "eager",
     persist_qweight: bool = False,
+    hybrid_policy: str = "auto",
+    hybrid_threshold: int = 128,
+    allow_activation_group_remap: bool = False,
+    hybrid_profile_stats: bool = False,
 ) -> tuple[nn.Module, Any, dict[str, Any]]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    if runtime_backend not in {"eager", "hsvdq_cuda"}:
+    if runtime_backend not in {"eager", "hsvdq_cuda", "w4a16", "nunchaku", "hybrid"}:
         raise ValueError(f"unsupported runtime backend: {runtime_backend}")
-    if runtime_backend == "hsvdq_cuda" and dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("hsvdq_cuda runtime requires float16 or bfloat16")
+    if runtime_backend != "eager" and dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"{runtime_backend} runtime requires float16 or bfloat16")
+    if cpu_offload_layers and runtime_backend in {"nunchaku", "hybrid"}:
+        raise ValueError(f"{runtime_backend} runtime does not support decoder-layer CPU offload")
     metadata = json.loads((checkpoint_dir / "hsvdquant_config.json").read_text(encoding="utf-8"))
     model_kind = metadata.get("model_kind", "")
     if not model_kind:
@@ -2953,10 +2959,36 @@ def load_quant_checkpoint(
         states = torch.load(checkpoint_dir / "hsvdquant.pt", map_location="cpu")
     if runtime_backend == "hsvdq_cuda":
         from hsvdquant_cuda import build_hsvdq_cuda_linear
+    elif runtime_backend == "w4a16":
+        from hsvdquant_hybrid import build_w4a16_linear
+    elif runtime_backend == "nunchaku":
+        from hsvdquant_int4 import build_nunchaku_linear
+    elif runtime_backend == "hybrid":
+        from hsvdquant_hybrid import build_hybrid_linear
 
+    activation_group_remapped = False
     for name, state in states.items():
         if runtime_backend == "hsvdq_cuda":
             replacement = build_hsvdq_cuda_linear(state, dtype)
+        elif runtime_backend == "w4a16":
+            replacement = build_w4a16_linear(state, dtype)
+        elif runtime_backend == "nunchaku":
+            activation_group_remapped |= int(state.get("activation_group_size", 0)) != 64
+            replacement = build_nunchaku_linear(
+                state,
+                dtype,
+                allow_activation_group_remap=allow_activation_group_remap,
+            )
+        elif runtime_backend == "hybrid":
+            activation_group_remapped |= int(state.get("activation_group_size", 0)) != 64
+            replacement = build_hybrid_linear(
+                state,
+                dtype,
+                policy=hybrid_policy,
+                threshold=hybrid_threshold,
+                allow_activation_group_remap=allow_activation_group_remap,
+                profile_stats=hybrid_profile_stats,
+            )
         else:
             replacement = HSVQuantLinear(state, compute_dtype=dtype)
         _set_submodule(model, name, replacement)
@@ -2964,6 +2996,16 @@ def load_quant_checkpoint(
     gc.collect()
     model.eval()
     metadata["runtime_backend"] = runtime_backend
+    if runtime_backend in {"nunchaku", "hybrid"}:
+        from hsvdquant_hybrid import nunchaku_version
+
+        metadata["nunchaku_version"] = nunchaku_version()
+        metadata["activation_group_remap"] = activation_group_remapped
+    if runtime_backend == "hybrid":
+        metadata["hybrid_policy"] = hybrid_policy
+        metadata["hybrid_threshold"] = int(hybrid_threshold)
+        metadata["hybrid_profile_stats"] = bool(hybrid_profile_stats)
+        metadata["hybrid_weight_layout"] = "dual"
     if cpu_offload_layers:
         model.config.use_cache = False
         enable_eval_cpu_offload(model, device)
@@ -3434,6 +3476,10 @@ def eval_command(args: argparse.Namespace) -> None:
         cpu_offload_layers=args.cpu_offload_layers,
         runtime_backend=args.runtime_backend,
         persist_qweight=args.persist_qweight,
+        hybrid_policy=args.hybrid_policy,
+        hybrid_threshold=args.hybrid_threshold,
+        allow_activation_group_remap=args.allow_activation_group_remap,
+        hybrid_profile_stats=args.hybrid_profile_stats,
     )
     results = run_lm_eval(
         model,
@@ -3928,10 +3974,22 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", default="")
     evaluate.add_argument(
         "--runtime-backend",
-        choices=["eager", "hsvdq_cuda"],
+        choices=["eager", "hsvdq_cuda", "w4a16", "nunchaku", "hybrid"],
         default="eager",
-        help="eager reference path or native packed H-SVDQuant CUDA kernels",
+        help="eager, native baseline, Nunchaku W4A4, or hybrid W4A4/W4A16 runtime",
     )
+    evaluate.add_argument(
+        "--hybrid-policy",
+        choices=["auto", "force_w4a4", "force_w4a16"],
+        default="auto",
+    )
+    evaluate.add_argument("--hybrid-threshold", type=int, default=128)
+    evaluate.add_argument(
+        "--allow-activation-group-remap",
+        action="store_true",
+        help="allow Nunchaku A-g64 inference for a checkpoint calibrated with another activation group",
+    )
+    evaluate.add_argument("--hybrid-profile-stats", action="store_true")
     evaluate.add_argument(
         "--cpu-offload-layers",
         action="store_true",
