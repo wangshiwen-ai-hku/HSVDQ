@@ -36,67 +36,96 @@ for 4-Bit Large Language Model Inference}
 \maketitle
 
 \begin{abstract}
-Joint 4-bit weight--activation quantization is attractive for large language
-model inference, but activation outliers and anisotropic input sensitivity make
-the usual Euclidean smoothing and low-rank corrections unreliable. We introduce
-\method{}, a post-training method that optimizes channel smoothing, a
-high-precision low-rank branch, and the quantized residual in the geometry
-induced by the calibration Hessian. Eliminating the output-side low-rank factor
-in closed form yields a deflated Hessian, turning residual quantization into a
-standard Hessian-aware problem in the complement of the protected subspace. A
-two-channel objective further accounts for online activation-quantization noise.
-On Qwen3-8B at W4A4, rank 4, and group size 128, our current implementation
-obtains 67.83 MMLU accuracy and 10.50 WikiText-2 perplexity, while an
-orthogonal block-Hadamard transform improves these values to 70.11 and 10.18.
-We evaluate accuracy independently from systems performance and report operator,
-GPU-execution, and synchronized model latency under a common no-offload
-protocol. \draftnote{Replace the preliminary numbers and complete the fused
-runtime results before submission.}
+At W4A4, weight and activation errors become too large for post-training methods
+that only tune quantization scales and integer codes: these variables can adjust
+the quantization grid but cannot efficiently represent coherent residual
+structure. We therefore retain a small full-precision SVD bypass and quantize
+only the remaining residual. Our key finding is that jointly optimizing the
+channel smoother, residual codes, and two low-rank factors forms a highly
+structured mathematical problem rather than a collection of independent
+heuristics. We introduce \method{}, which solves this problem in the calibration
+Hessian geometry. Exact elimination of the output-side low-rank factor produces
+a deflated Hessian and reduces the discrete update to standard Hessian-aware
+residual quantization. An error decomposition further yields a low-rank-aware
+activation-quantization term, $F_W+\lambda F_A$, which directly targets the
+dominant W4A4 error. On Qwen3-8B at rank 4 and group size 128, \method{} obtains
+67.83 MMLU accuracy and 10.50 WikiText-2 perplexity; an orthogonal block-Hadamard
+extension improves them to 70.11 and 10.18. For supported operator regimes, our
+fused implementation is evaluated at complete-operator, model-GPU, and
+synchronized wall-clock scopes and outperforms prior quantized paths.
+\draftnote{Insert the exact three-scope speedups, hardware, and workload after
+the new fused-runtime report is imported.}
 \end{abstract}
 
 \section{Introduction}
 
 Post-training quantization reduces the memory traffic and arithmetic cost of
 large language model (LLM) inference without retraining. Weight-only W4A16
-methods such as GPTQ and AWQ are particularly effective for bandwidth-bound
-single-token decoding~\citep{frantar2022gptq,lin2023awq}. Quantizing activations
-as well can accelerate matrix--matrix products in prompt processing, but 4-bit
-activations expose severe channel outliers. SmoothQuant moves outlier magnitude
-from activations into weights through an equivalent diagonal
-transformation~\citep{xiao2023smoothquant}; rotation methods instead spread
-outliers across channels~\citep{ashkboos2024quarot,liu2024spinquant}.
+methods such as GPTQ and AWQ can preserve accuracy and accelerate
+bandwidth-bound decoding~\citep{frantar2022gptq,lin2023awq}. W4A4 is more
+ambitious: it also enables low-bit activation arithmetic during compute-bound
+prompt processing. In this regime, however, weight and activation errors
+compound. Outliers set coarse group scales, and the small codebook leaves too
+little freedom to recover the layer output. Smoothing, clipping, and
+second-order code updates improve the grid, but once the W4A4 error crosses this
+representation limit, optimizing quantization coefficients alone is
+insufficient.
 
-Low-rank-assisted quantization provides a complementary mechanism: preserve a
-small, sensitive component in high precision and quantize only the residual.
-SVDQuant demonstrates this idea for diffusion transformers and co-designs a
-fused W4A4 engine~\citep{li2024svdquant}; LRC studies low-rank correction for
-W4A4 LLMs~\citep{scetbon2024lrc}. However, plain truncated SVD treats every
-input direction equally. The output error of a linear layer is instead weighted
-by the calibration second moment $\Hess=\X^\top\X$. A low-rank direction with
-modest Euclidean energy can be critical when the model is highly sensitive along
-that direction, while a visually large direction can be nearly irrelevant.
+Our starting point is to increase representational capacity without abandoning
+an efficient low-bit main path. A small full-precision SVD bypass captures a
+coherent component that is expensive for 4-bit codes, while the remaining
+residual stays in a regular W4A4 layout. SVDQuant demonstrates this principle
+for diffusion transformers~\citep{li2024svdquant}, and LRC studies low-rank
+correction for W4A4 LLMs~\citep{scetbon2024lrc}. The bypass must nevertheless be
+chosen together with the quantized path: an independently fitted Euclidean SVD
+can protect directions that carry large weight energy but little output
+sensitivity, while leaving the quantizer responsible for directions amplified
+by the input distribution.
 
-\method{} formulates smoothing, low-rank protection, and residual quantization
-in this Hessian geometry. Its central structural result is that, for a fixed
-input-side low-rank subspace, the output-side factor can be removed exactly.
-The resulting metric is a Hessian with that subspace deflated. This connects
-low-rank correction directly to GPTQ-style residual quantization instead of
-treating the two components as independent heuristics.
+The central methodological observation of this work is that the combined design
+is unusually complete and structured. The diagonal smoother $D$, integer codes
+$Z$, and low-rank factors $L_1,L_2$ can be placed in one layer-output objective
+under the calibration Hessian $H=X^\top X$. For a fixed input-side subspace,
+$L_2$ has an exact weighted least-squares solution. Eliminating it deflates $H$
+along the protected subspace, so the discrete residual update becomes a familiar
+GPTQ/GANQ-style problem under a modified metric. The same geometry gives a
+curvature-aware smoother and a practical alternating algorithm rather than
+separate tuning rules for each component.
 
-This paper makes three methodological contributions:
+W4A4 also has an error channel absent from weight-only quantization: the online
+activation quantizer acts on the residual branch. Our error decomposition
+separates weight error $F_W$ from activation error $F_A$ and introduces the
+low-rank-aware objective $F_W+\lambda F_A$. Here $F_A$ is evaluated after the
+bypass removes its protected component, so $\lambda$ controls the remaining
+activation-noise exposure rather than applying a generic activation penalty.
+This term is responsible for the V2 accuracy improvement and is isolated in our
+ablations.
+
+The bypass also creates a systems requirement. Executing smoothing, residual
+W4A4/W4A16 multiplication, and two small dense products as separate kernels can
+erase every theoretical INT4 gain. We therefore fuse the bypass and residual
+path for the operator shapes on which they are beneficial, and assess speed at
+three non-interchangeable scopes: complete Linear operator latency, accumulated
+GPU execution in the full model, and synchronized model wall time. Claims are
+restricted to the supported operator and workload regimes where all three
+measurements beat the corresponding optimized baselines.
+
+This paper makes four contributions:
 \begin{itemize}
-    \item We formulate W4A4 low-rank-assisted PTQ with a joint weight-error and
-    activation-noise objective in the calibration Hessian geometry.
-    \item We derive exact output-factor elimination and Hessian deflation, and
-    use these results in a practical alternating solver for smoothing,
-    low-rank factors, and integer residual codes.
-    \item We isolate the method from orthogonal rotation transforms and from the
-    inference backend through factorial accuracy experiments and three-scope
-    systems measurements.
+    \item We identify the representation limit of scale/code-only W4A4 PTQ and
+    use a small full-precision SVD bypass to recover structured residual error.
+    \item We formulate smoothing, integer codes, and both bypass factors as one
+    Hessian-aware problem, derive exact output-factor elimination and Hessian
+    deflation, and obtain a practical alternating solver.
+    \item We derive a low-rank-aware activation-loss term
+    $F_W+\lambda F_A$ and show that it improves W4A4 inference quality beyond
+    optimizing the weight channel alone.
+    \item We co-design fused W4A4/W4A16 operators and evaluate their advantage
+    over prior paths at operator, model-GPU, and model-wall scopes under matched
+    no-offload conditions.
 \end{itemize}
-The fused runtime is an implementation objective, not yet a claimed algorithmic
-contribution; it will be promoted to a contribution only after it beats the same
-optimized FP16 baseline end to end.
+\draftnote{The fourth contribution remains conditional until the new report
+supplies exact speedups and identifies the supported operator regimes.}
 
 \section{Background and Related Work}
 
@@ -283,14 +312,16 @@ that Hadamard is part of \method{}.
 
 \input{tables/runtime_status}
 
-The current runtime results in Table~\ref{tab:runtime-status} are diagnostic:
-no measured path accelerates the complete model over FP16. Marlin confirms that
+The unfused runtime results in Table~\ref{tab:runtime-status} are diagnostic:
+none of these earlier paths accelerates the complete model over FP16. Marlin confirms that
 production W4A16 can accelerate the large MLP projections, but its roughly
 constant launch/tile floor loses on smaller Q/K/V projections. Splitting smooth,
 packed multiplication, and rank-4 correction into separate launches then erases
 the remaining gain. Our next backend groups QKV and gate/up projections and
 fuses smoothing and low-rank correction with the packed epilogue. A systems
 claim is accepted only if the fused path passes all three scopes.
+\draftnote{Replace this transition and Table~\ref{tab:runtime-status} with the
+new operator-specific fused results.}
 
 \section{Ablations and Analysis}
 
