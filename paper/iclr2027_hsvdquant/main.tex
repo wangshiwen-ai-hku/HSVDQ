@@ -1,0 +1,383 @@
+\documentclass{article}
+\usepackage{iclr2027_conference,times}
+\input{math_commands.tex}
+
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\newtheorem{proposition}{Proposition}
+\newcommand{\method}{H-SVDQuant}
+\newcommand{\X}{\bm{X}}
+\newcommand{\W}{\bm{W}}
+\newcommand{\Hess}{\bm{H}}
+\newcommand{\D}{\bm{D}}
+\newcommand{\Lo}{\bm{L}_1}
+\newcommand{\Lt}{\bm{L}_2}
+\newcommand{\Qw}{\mathcal{Q}_{W}}
+\newcommand{\Qa}{\mathcal{Q}_{A}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\pending}{\textcolor{gray}{pending}}
+\newcommand{\draftnote}[1]{\textcolor{red!70!black}{[Draft: #1]}}
+
+\title{H-SVDQuant: Hessian-Aware Smoothing and Low-Rank Correction\\
+for 4-Bit Large Language Model Inference}
+
+% Keep anonymous for ICLR submission.
+\author{Anonymous authors}
+
+% \iclrfinalcopy
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Joint 4-bit weight--activation quantization is attractive for large language
+model inference, but activation outliers and anisotropic input sensitivity make
+the usual Euclidean smoothing and low-rank corrections unreliable. We introduce
+\method{}, a post-training method that optimizes channel smoothing, a
+high-precision low-rank branch, and the quantized residual in the geometry
+induced by the calibration Hessian. Eliminating the output-side low-rank factor
+in closed form yields a deflated Hessian, turning residual quantization into a
+standard Hessian-aware problem in the complement of the protected subspace. A
+two-channel objective further accounts for online activation-quantization noise.
+On Qwen3-8B at W4A4, rank 4, and group size 128, our current implementation
+obtains 67.83 MMLU accuracy and 10.50 WikiText-2 perplexity, while an
+orthogonal block-Hadamard transform improves these values to 70.11 and 10.18.
+We evaluate accuracy independently from systems performance and report operator,
+GPU-execution, and synchronized model latency under a common no-offload
+protocol. \draftnote{Replace the preliminary numbers and complete the fused
+runtime results before submission.}
+\end{abstract}
+
+\section{Introduction}
+
+Post-training quantization reduces the memory traffic and arithmetic cost of
+large language model (LLM) inference without retraining. Weight-only W4A16
+methods such as GPTQ and AWQ are particularly effective for bandwidth-bound
+single-token decoding~\citep{frantar2022gptq,lin2023awq}. Quantizing activations
+as well can accelerate matrix--matrix products in prompt processing, but 4-bit
+activations expose severe channel outliers. SmoothQuant moves outlier magnitude
+from activations into weights through an equivalent diagonal
+transformation~\citep{xiao2023smoothquant}; rotation methods instead spread
+outliers across channels~\citep{ashkboos2024quarot,liu2024spinquant}.
+
+Low-rank-assisted quantization provides a complementary mechanism: preserve a
+small, sensitive component in high precision and quantize only the residual.
+SVDQuant demonstrates this idea for diffusion transformers and co-designs a
+fused W4A4 engine~\citep{li2024svdquant}; LRC studies low-rank correction for
+W4A4 LLMs~\citep{scetbon2024lrc}. However, plain truncated SVD treats every
+input direction equally. The output error of a linear layer is instead weighted
+by the calibration second moment $\Hess=\X^\top\X$. A low-rank direction with
+modest Euclidean energy can be critical when the model is highly sensitive along
+that direction, while a visually large direction can be nearly irrelevant.
+
+\method{} formulates smoothing, low-rank protection, and residual quantization
+in this Hessian geometry. Its central structural result is that, for a fixed
+input-side low-rank subspace, the output-side factor can be removed exactly.
+The resulting metric is a Hessian with that subspace deflated. This connects
+low-rank correction directly to GPTQ-style residual quantization instead of
+treating the two components as independent heuristics.
+
+This paper makes three methodological contributions:
+\begin{itemize}
+    \item We formulate W4A4 low-rank-assisted PTQ with a joint weight-error and
+    activation-noise objective in the calibration Hessian geometry.
+    \item We derive exact output-factor elimination and Hessian deflation, and
+    use these results in a practical alternating solver for smoothing,
+    low-rank factors, and integer residual codes.
+    \item We isolate the method from orthogonal rotation transforms and from the
+    inference backend through factorial accuracy experiments and three-scope
+    systems measurements.
+\end{itemize}
+The fused runtime is an implementation objective, not yet a claimed algorithmic
+contribution; it will be promoted to a contribution only after it beats the same
+optimized FP16 baseline end to end.
+
+\section{Background and Related Work}
+
+\paragraph{Hessian-aware weight quantization.}
+For a linear layer $Y=XW$, second-order PTQ minimizes a layer reconstruction
+objective weighted by $H=X^\top X$. GPTQ uses approximate second-order updates
+to quantize large language models accurately~\citep{frantar2022gptq}. GANQ
+extends this view with GPU-adaptive non-uniform quantization~\citep{zhao2025ganq}.
+Our residual-code update uses the same family of solvers, but under a metric
+modified by the low-rank branch and activation-noise term.
+
+\paragraph{Smoothing and rotations.}
+SmoothQuant transfers activation difficulty into weights using diagonal
+rescaling~\citep{xiao2023smoothquant}. QuaRot and SpinQuant use orthogonal
+rotations to suppress activation outliers~\citep{ashkboos2024quarot,liu2024spinquant}.
+We treat block Hadamard as an external, orthogonal component: ``\method{} +
+Hadamard'' is not renamed as our standalone method, and its gain is measured
+against the corresponding non-Hessian low-rank baseline with the same transform.
+
+\paragraph{Low-rank-assisted quantization.}
+SVDQuant absorbs outliers into a high-precision low-rank branch and fuses that
+branch with W4A4 diffusion kernels~\citep{li2024svdquant}. LRC jointly optimizes
+quantized weights and low-rank matrices acting on unquantized LLM
+activations~\citep{scetbon2024lrc}. Our distinction is geometric: both smoothing
+and correction are selected with second-order sensitivity, and low-rank
+elimination explicitly changes the metric used to quantize the residual.
+
+\paragraph{Inference systems.}
+Marlin is a production-oriented W4A16 kernel for autoregressive
+inference~\citep{frantar2024marlin}. QServe shows that dequantization and
+non-Tensor-Core work can erase nominal INT4 gains and therefore co-designs the
+quantizer and serving kernels~\citep{lin2024qserve}. We follow the same systems
+lesson: compression ratio alone is not reported as speedup.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Joint W4A4 formulation}
+
+Consider calibration activations $\X\in\mathbb{R}^{m\times c}$ and a weight
+$\W\in\mathbb{R}^{c\times n}$. A positive diagonal smoother $\D$ defines
+\begin{equation}
+    \widetilde{\X}=\X\D^{-1},\qquad
+    \widetilde{\W}=\D\W,
+\end{equation}
+so the full-precision product is unchanged. We decompose
+$\widetilde{\W}=\Lo\Lt+\bm{R}$ and evaluate
+\begin{equation}
+\widehat{\bm{Y}}=
+    \widetilde{\X}\Lo\Lt+
+    \Qa(\widetilde{\X})\Qw(\bm{R}).
+\label{eq:forward}
+\end{equation}
+The low-rank factors are stored in FP16/BF16; the residual weights and dynamic
+activations use signed 4-bit group quantization.
+
+Let $\bm{E}_A=\Qa(\widetilde{\X})-\widetilde{\X}$ and
+$\Delta\W=\bm{R}-\Qw(\bm{R})$. Ignoring the second-order product
+$\bm{E}_A\Delta\W$ gives the surrogate
+\begin{equation}
+\mathcal{L}\approx
+\underbrace{\tr(\Delta\W^\top\widetilde{\Hess}\Delta\W)}_{F_W}
++\lambda
+\underbrace{\tr(\Qw(\bm{R})^\top\bm{\Sigma}_A\Qw(\bm{R}))}_{F_A},
+\label{eq:two-channel}
+\end{equation}
+where $\widetilde{\Hess}=\D^{-1}\Hess\D^{-1}$ and
+$\bm{\Sigma}_A=\mathbb{E}[\bm{E}_A^\top\bm{E}_A]$. $F_W$ measures sensitivity
+to residual weight error; $F_A$ penalizes quantized residual energy in channels
+where A4 noise is large.
+
+\subsection{Low-rank correction as Hessian deflation}
+
+For fixed $\D$, $\Lo$, and a quantized residual column
+$\widehat{\bm w}_j$, the output factor is a small weighted least-squares
+problem.
+
+\begin{proposition}[Output-factor elimination]
+Let $\bm{M}=\Lo^\top\widetilde{\Hess}\Lo\succ0$. The minimizer of
+\[
+\min_{\bm\ell\in\mathbb{R}^r}
+\|\widetilde{\X}(\widetilde{\bm w}_j-\Lo\bm\ell-
+\widehat{\bm w}_j)\|_2^2
+\]
+is
+\begin{equation}
+\bm\ell_j^\star=\bm{M}^{-1}\Lo^\top\widetilde{\Hess}
+(\widetilde{\bm w}_j-\widehat{\bm w}_j).
+\end{equation}
+Substitution yields the residual metric
+\begin{equation}
+\widetilde{\Hess}_{\perp}=
+\widetilde{\Hess}-\widetilde{\Hess}\Lo
+(\Lo^\top\widetilde{\Hess}\Lo)^{-1}
+\Lo^\top\widetilde{\Hess}.
+\label{eq:deflation}
+\end{equation}
+\end{proposition}
+
+Equation~\ref{eq:deflation} has a direct interpretation: the FP branch removes
+the directions it spans from the loss seen by the 4-bit residual. Residual
+codes can therefore be optimized with a GPTQ/GANQ-style solver after replacing
+$\widetilde{\Hess}$ by $\widetilde{\Hess}_{\perp}$.
+
+\subsection{Hessian-aware smoothing and code updates}
+
+We parameterize $\Lo=\D\bm{A}$ so the low-rank branch is evaluated in the
+original input coordinates and does not require an additional runtime smoother.
+For fixed branch $\bm{B}=\bm{A}\Lt$, we optimize the positive diagonal $\D$
+against groupwise models of $F_W+\lambda F_A$. The implementation starts from
+the curvature--residual balance
+\begin{equation}
+d_i\propto
+\left(\frac{[\Hess_\perp]_{ii}}
+{\|[\W-\bm{B}]_{i,:}\|_p^p+\epsilon}\right)^{1/(p+2)}
+\label{eq:d-init}
+\end{equation}
+and refines $\log d_i$ on cached calibration tokens. Geometric-mean
+normalization removes the scale ambiguity.
+
+For fixed $\D$ and $\Lo$, completing the square in
+Equation~\ref{eq:two-channel} produces
+\begin{equation}
+\bm{M}_Q=\widetilde{\Hess}_{\perp}+\lambda\bm{\Sigma}_A,
+\qquad
+\bm{T}_Q=\bm{M}_Q^{-1}\widetilde{\Hess}_{\perp}\widetilde{\W}.
+\label{eq:joint-target}
+\end{equation}
+We quantize $\bm{T}_Q$ under $\bm{M}_Q$, refit $\Lt$ exactly, and alternate the
+blocks. Algorithmic details and derivations are provided in the appendix.
+
+\section{Experimental Design}
+\label{sec:experiments}
+
+\paragraph{Separation of claims.}
+Accuracy experiments use the eager reference implementation, so they can run
+before the fused kernel is complete. Systems experiments use numerically checked
+packed backends and compare against the same optimized FP16 implementation.
+This prevents a backend limitation from obscuring the quantization method and
+prevents an eager implementation from being presented as deployable speedup.
+
+\paragraph{Primary protocol.}
+The primary setting is W4A4, low-rank $r=4$, symmetric weight groups of 128,
+and per-token activation groups of 128. Group size 128 is a community protocol,
+not a method contribution. We calibrate on 128 C4 sequences of length 512 and
+evaluate WikiText-2 and C4 perplexity plus MMLU, GSM8K, ARC-Challenge,
+ARC-Easy, HellaSwag, and PIQA. The main models are Qwen3-8B and a second 7--8B
+model family. \draftnote{Freeze the second model after the first complete
+baseline sweep; Llama-3.1-8B is the preferred choice.}
+
+\paragraph{Accuracy comparisons.}
+The required rows are FP16, RTN W4A4, GPTQ/AWQ weight-only references,
+SmoothQuant, QuaRot or SpinQuant, LRC, adapted SVDQuant, and \method{}. We add a
+factorial low-rank comparison:
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & No rotation & Block Hadamard \\
+\midrule
+Non-Hessian low-rank baseline & required & required \\
+\method{} & required & required \\
+\bottomrule
+\end{tabular}
+\end{center}
+This reports the Hessian gain both without and with the external transform.
+
+\paragraph{Performance comparisons.}
+We report: (i) complete Linear operator latency, including smoothing,
+activation quantization, residual multiplication, low-rank correction, and
+bias; (ii) accumulated GPU execution time in a cached model decode window; and
+(iii) synchronized model wall time for the same window. Model loading,
+tokenization, network time, and CPU offload are excluded. Prefill and decode are
+reported separately with TTFT, TPOT, tokens/s, peak memory, and CUDA event count.
+
+\section{Preliminary Results}
+
+\input{tables/current_accuracy}
+
+Table~\ref{tab:current-accuracy} establishes the current accuracy anchor but
+does not yet identify the Hessian-only gain because the matched non-Hessian
+low-rank rows are missing. Hadamard recovers 2.44 points on average across the
+seven downstream metrics, but this is evidence of compatibility, not evidence
+that Hadamard is part of \method{}.
+
+\input{tables/runtime_status}
+
+The current runtime results in Table~\ref{tab:runtime-status} are diagnostic:
+no measured path accelerates the complete model over FP16. Marlin confirms that
+production W4A16 can accelerate the large MLP projections, but its roughly
+constant launch/tile floor loses on smaller Q/K/V projections. Splitting smooth,
+packed multiplication, and rank-4 correction into separate launches then erases
+the remaining gain. Our next backend groups QKV and gate/up projections and
+fuses smoothing and low-rank correction with the packed epilogue. A systems
+claim is accepted only if the fused path passes all three scopes.
+
+\section{Ablations and Analysis}
+
+The main ablation is a $2\times2$ decomposition of the two Hessian mechanisms:
+plain smoothing/plain SVD; Hessian smoothing/plain SVD; plain smoothing/Hessian
+low rank; and both. We additionally sweep rank $r\in\{0,2,4,8,16\}$, weight and
+activation group size, calibration size, alternating iterations, and
+$\lambda$. Layerwise $F_W$, $F_A$, output NMSE, and accumulated hidden-state
+drift connect the optimization objective to downstream accuracy.
+
+For systems analysis, we sweep matrix rows $M\in\{1,2,4,8,16,64,128,256,1024\}$
+for Q/O, K/V, gate/up, and down shapes. We report event counts and a latency tax
+decomposition for smoothing, packed multiplication, low-rank down/up
+projections, and framework dispatch. This determines whether a failure is an
+algorithmic arithmetic tax, a kernel throughput problem, or launch overhead.
+
+\section{Limitations}
+
+The present evidence is limited to one fully evaluated 8B model and one RTX
+4090 runtime. The optional Hadamard path is implemented only in the eager
+backend, and cached-generation behavior must be validated before reporting its
+generation tasks. Low-rank FP factors reduce the nominal compression ratio and
+add arithmetic whose relative cost depends on rank, matrix shape, batch size,
+and GPU architecture. Finally, the additive-noise surrogate omits a second-order
+activation--weight error term; its usefulness is empirical rather than an exact
+model of deterministic quantization.
+
+\section{Conclusion}
+
+\method{} places smoothing, low-rank protection, and residual quantization in a
+shared Hessian geometry. Exact low-rank factor elimination exposes a deflated
+metric that can be consumed by established second-order quantizers, while a
+joint activation-noise term targets the failure mode specific to W4A4. The
+remaining work is deliberately separated: matched accuracy baselines establish
+the algorithmic contribution, and a fused grouped backend must establish any
+deployment claim against optimized FP16.
+
+\subsubsection*{AI use statement}
+Generative AI tools were used to assist with document organization, language
+editing, benchmark-code development, and LaTeX preparation. The authors are
+responsible for the method, experiments, verification of all generated code and
+claims, and the final text. \draftnote{Coauthors must review this disclosure
+against the final ICLR policy and the actual usage before submission.}
+
+\bibliography{references}
+\bibliographystyle{iclr2027_conference}
+
+\appendix
+\section{Derivation of Hessian deflation}
+
+Writing $\bm e_j=\widetilde{\bm w}_j-\widehat{\bm w}_j$, the fixed-column loss
+is
+\[
+f(\bm\ell)=(\bm e_j-\Lo\bm\ell)^\top
+\widetilde{\Hess}(\bm e_j-\Lo\bm\ell).
+\]
+Setting its gradient to zero gives
+$\Lo^\top\widetilde{\Hess}\Lo\bm\ell=
+\Lo^\top\widetilde{\Hess}\bm e_j$. Substitution of the solution gives
+$\bm e_j^\top\widetilde{\Hess}_\perp\bm e_j$ with
+$\widetilde{\Hess}_\perp$ from Equation~\ref{eq:deflation}. Thus the
+high-precision branch creates a rank-$r$ null space in the residual
+quantization metric.
+
+\section{Alternating calibration algorithm}
+
+For each Linear layer, we accumulate $H=X^\top X$ and a bounded activation
+reservoir. Starting from an empty branch, each outer iteration performs:
+\begin{enumerate}
+    \item deflate $H$ using the previous input-side branch;
+    \item initialize and refine $D$ using Equation~\ref{eq:d-init} and the
+    groupwise two-channel surrogate;
+    \item compute a rank-$r$ weighted approximation under the smoothed Hessian;
+    \item form the joint target in Equation~\ref{eq:joint-target} and apply
+    GPTQ-style grouped residual quantization;
+    \item refit $L_2$ by weighted least squares and retain the candidate with
+    the smallest measured calibration output error.
+\end{enumerate}
+All downstream evaluations use the same saved integer codes, scales, smoother,
+and low-rank factors.
+
+\section{Required supplementary tables}
+
+The final supplement will contain per-model task metrics, calibration
+sensitivity, rank and group sweeps, cached/no-cache equivalence checks,
+per-shape operator latency distributions, Nsight/CUDA event summaries, and
+hardware/software versions. Seeds and raw JSON files will be released with the
+artifact.
+
+\end{document}
