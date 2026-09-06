@@ -11,6 +11,12 @@ PROMPT_LEN=${PROMPT_LEN:-256}
 DECODE_LEN=${DECODE_LEN:-32}
 WARMUP=${WARMUP:-3}
 ITERS=${ITERS:-10}
+WINDOW_REPEATS=${WINDOW_REPEATS:-3}
+PROFILE_CUDA=${PROFILE_CUDA:-1}
+PROFILE_STEPS=${PROFILE_STEPS:-16}
+PROFILE_LINEAR_KERNELS=${PROFILE_LINEAR_KERNELS:-1}
+LINEAR_ROWS=${LINEAR_ROWS:-1,4,16,64,128,256,512,1024}
+PROFILE_LINEAR_ROWS=${PROFILE_LINEAR_ROWS:-1,256}
 HYBRID_THRESHOLD=${HYBRID_THRESHOLD:-128}
 ALLOW_ACTIVATION_GROUP_REMAP=${ALLOW_ACTIVATION_GROUP_REMAP:-1}
 RUN_PURE_W4A4=${RUN_PURE_W4A4:-1}
@@ -39,10 +45,17 @@ fi
   --require-nunchaku
 
 if [[ "${RUN_LINEAR_SWEEP}" == "1" ]]; then
+  LINEAR_PROFILE_ARGS=()
+  if [[ "${PROFILE_LINEAR_KERNELS}" == "1" ]]; then
+    LINEAR_PROFILE_ARGS+=(--profile-kernels)
+  fi
   "${PYTHON_BIN}" scripts/benchmarks/bench_hybrid_linear.py \
     --checkpoint "${CHECKPOINT}" \
     --device "${DEVICE}" \
     --dtype "${DTYPE}" \
+    --rows "${LINEAR_ROWS}" \
+    --profile-rows "${PROFILE_LINEAR_ROWS}" \
+    "${LINEAR_PROFILE_ARGS[@]}" \
     "${REMAP_ARGS[@]}" \
     --output "${OUTPUT}/linear_crossover.json"
 fi
@@ -53,9 +66,14 @@ COMMON_ARGS=(
   --decode-len "${DECODE_LEN}"
   --warmup "${WARMUP}"
   --iters "${ITERS}"
+  --window-repeats "${WINDOW_REPEATS}"
   --device "${DEVICE}"
   --dtype "${DTYPE}"
 )
+
+if [[ "${PROFILE_CUDA}" == "1" ]]; then
+  COMMON_ARGS+=(--profile-cuda --profile-steps "${PROFILE_STEPS}")
+fi
 
 "${PYTHON_BIN}" scripts/benchmarks/bench_latency.py \
   "${COMMON_ARGS[@]}" \
