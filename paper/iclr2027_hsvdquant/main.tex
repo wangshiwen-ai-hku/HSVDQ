@@ -36,11 +36,11 @@ for 4-Bit Large Language Model Inference}
 \maketitle
 
 \begin{abstract}
-At W4A4, weight and activation errors become too large for post-training methods
-that only tune quantization scales and integer codes: these variables can adjust
-the quantization grid but cannot efficiently represent coherent residual
-structure. We therefore retain a small full-precision SVD bypass and quantize
-only the remaining residual. Our key finding is that jointly optimizing the
+At W4A4, weight and activation errors compound, and post-training methods that
+only tune quantization scales and integer codes can leave a substantial,
+structured residual error. We therefore retain a small full-precision SVD
+bypass to absorb this residual structure and quantize only the remaining
+component. Our key finding is that jointly optimizing the
 channel smoother, residual codes, and two low-rank factors forms a highly
 structured mathematical problem rather than a collection of independent
 heuristics. We introduce \method{}, which solves this problem in the calibration
@@ -67,14 +67,14 @@ ambitious: it also enables low-bit activation arithmetic during compute-bound
 prompt processing. In this regime, however, weight and activation errors
 compound. Outliers set coarse group scales, and the small codebook leaves too
 little freedom to recover the layer output. Smoothing, clipping, and
-second-order code updates improve the grid, but once the W4A4 error crosses this
-representation limit, optimizing quantization coefficients alone is
-insufficient.
+second-order code updates improve the grid, yet they can still leave a
+substantial accuracy gap and a residual error concentrated in a small number of
+directions.
 
-Our starting point is to increase representational capacity without abandoning
-an efficient low-bit main path. A small full-precision SVD bypass captures a
-coherent component that is expensive for 4-bit codes, while the remaining
-residual stays in a regular W4A4 layout. SVDQuant demonstrates this principle
+Our starting point is to model this structured residual explicitly without
+abandoning an efficient low-bit main path. A small full-precision SVD bypass
+captures the coherent component left by scale/code optimization, while the
+remaining residual stays in a regular W4A4 layout. SVDQuant demonstrates this principle
 for diffusion transformers~\citep{li2024svdquant}, and LRC studies low-rank
 correction for W4A4 LLMs~\citep{scetbon2024lrc}. The bypass must nevertheless be
 chosen together with the quantized path: an independently fitted Euclidean SVD
@@ -112,8 +112,8 @@ measurements beat the corresponding optimized baselines.
 
 This paper makes four contributions:
 \begin{itemize}
-    \item We identify the representation limit of scale/code-only W4A4 PTQ and
-    use a small full-precision SVD bypass to recover structured residual error.
+    \item We identify structured residual error left by scale/code-only W4A4
+    PTQ and use a small full-precision SVD bypass to absorb it.
     \item We formulate smoothing, integer codes, and both bypass factors as one
     Hessian-aware problem, derive exact output-factor elimination and Hessian
     deflation, and obtain a practical alternating solver.
